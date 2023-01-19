@@ -1,21 +1,28 @@
 #[macro_use]
-extern crate core;
 extern crate alloc;
+extern crate core;
 
 pub mod db;
 
-use std::borrow::{Borrow, BorrowMut};
 use crate::db::record_entry;
+use async_stream::try_stream;
+use futures::stream::TryStreamExt;
 use mysql_slowlog_parser::{EntryMasking, ReadError, Reader};
-use sqlx::{Row, Sqlite, SqlitePool};
+use sqlx::migrate::MigrateError;
+use sqlx::SqlitePool;
 use std::io::BufRead;
 use thiserror::Error;
-use tokio::task;
+
+use db::InvalidPrimaryKey;
 
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("io error: {0}")]
     IO(#[from] std::io::Error),
+    #[error("invalid primary key: {0}")]
+    InvalidPrimaryKey(#[from] InvalidPrimaryKey),
+    #[error("migration error: {0}")]
+    Migrate(#[from] MigrateError),
     #[error("parser error: {0}")]
     Parser(#[from] ReadError),
     #[error("db error: {0}")]
@@ -25,16 +32,23 @@ pub enum Error {
 pub async fn record_log<'a>(c: SqlitePool, br: &'a mut dyn BufRead) -> Result<(), Error> {
     let mut r = Reader::new(br, EntryMasking::PlaceHolder)?;
 
-    while let Some(e) = r.read_entry()? {
-            record_entry(c.clone(), e).await.unwrap();
-    }
+    let s = try_stream! {
+        while let Some(e) = r.read_entry()? {
+            yield e;
+        }
+    };
 
-    return Ok(());
+    s.try_for_each(|e| async {
+        let _ = record_entry(c.clone(), e).await?;
+
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{open};
+    use crate::db::open;
     use crate::record_log;
     use fs::File;
     use std::fs;
@@ -42,7 +56,8 @@ mod tests {
 
     #[tokio::test]
     async fn can_record_log() {
-        let mut c = open(None).await.unwrap();
+        //let mut c = open(Some("/tmp/analyzer-test".into())).await.unwrap();
+        let c = open(None).await.unwrap();
 
         let mut f = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
 

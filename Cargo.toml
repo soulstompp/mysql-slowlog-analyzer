@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-stream = "0.3.3"
 nom = "7.1.1"
 mysql-slowlog-parser = { git = "https://github.com/soulstompp/mysql-slowlog-parser", branch="0.1.0" }
 sqlx = {version = "0.6.2", features = ["json", "macros", "runtime-tokio-native-tls", "sqlite", "time"]}
@@ -13,3 +14,4 @@ thiserror = "1.0.38"
 time = {version = "0.3.17", features = ["parsing"]}
 serde_json = "1.0.91"
 tokio = {version = "1.24.1", features = ["full"]}
+futures = "0.3.25"
