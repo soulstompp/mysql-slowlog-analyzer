@@ -1,12 +1,11 @@
 use crate::Error;
-use core::fmt::{write, Display, Formatter};
+use core::fmt::{Display, Formatter};
 use core::str::FromStr;
 use mysql_slowlog_parser::EntryStatement::{AdminCommand, SqlStatement};
 use mysql_slowlog_parser::{Entry, EntryStatement};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
-use std::collections::HashMap;
 use time::format_description::well_known::iso8601::Iso8601;
 use time::OffsetDateTime;
 
@@ -86,6 +85,19 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<
     let query_call_id = insert_query_call(
         tx,
         InsertQueryCallParams::new(query_id, e.start_timestamp(), e.time().to_string()),
+    )
+    .await?;
+
+    let _ = insert_query_session(
+        tx,
+        InsertQuerySessionParams {
+            query_call_id,
+            user_name: e.user().to_string(),
+            sys_user_name: e.sys_user().to_string(),
+            host_name: e.host().to_string(),
+            ip_address: e.ip_address().to_string(),
+            thread_id: e.thread_id(),
+        },
     )
     .await?;
 
@@ -188,6 +200,36 @@ async fn insert_query_call(
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
+
+struct InsertQuerySessionParams {
+    query_call_id: u32,
+    user_name: String,
+    sys_user_name: String,
+    host_name: String,
+    ip_address: String,
+    thread_id: u32,
+}
+
+async fn insert_query_session(
+    tx: &mut Transaction<'_, Sqlite>,
+    params: InsertQuerySessionParams,
+) -> Result<(), Error> {
+    sqlx::query(
+        "INSERT INTO query_call_session (query_call_id, user_name, sys_user_name, host_name,
+        ip_address, thread_id)
+        VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(params.query_call_id)
+    .bind(params.user_name)
+    .bind(params.sys_user_name)
+    .bind(params.host_name)
+    .bind(params.ip_address)
+    .bind(params.thread_id)
+        .execute(tx)
+        .await?;
+
+    Ok(())
+}
+
 struct InsertQueryStatsParams {
     query_call_id: u32,
     query_time: f64,
@@ -199,8 +241,8 @@ struct InsertQueryStatsParams {
 async fn insert_query_stats(
     tx: &mut Transaction<'_, Sqlite>,
     params: InsertQueryStatsParams,
-) -> Result<u32, Error> {
-    let result = sqlx::query(
+) -> Result<(), Error> {
+    let _ = sqlx::query(
     "INSERT INTO query_call_stats (query_call_id, query_time, lock_time, rows_sent, rows_examined)
         VALUES (?, ?, ?, ?, ?)")
         .bind(params.query_call_id)
@@ -211,9 +253,7 @@ async fn insert_query_stats(
         .execute(tx)
         .await?;
 
-    let id = result.last_insert_rowid();
-
-    u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
+    Ok(())
 }
 
 struct InsertQueryDetailsParams {
@@ -224,8 +264,8 @@ struct InsertQueryDetailsParams {
 async fn insert_query_details(
     tx: &mut Transaction<'_, Sqlite>,
     params: InsertQueryDetailsParams,
-) -> Result<u32, Error> {
-    let result = sqlx::query(
+) -> Result<(), Error> {
+    let _ = sqlx::query(
         "INSERT INTO query_call_details (query_call_id, details)
         VALUES (?, ?)",
     )
@@ -234,7 +274,5 @@ async fn insert_query_details(
     .execute(tx)
     .await?;
 
-    let id = result.last_insert_rowid();
-
-    u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
+    Ok(())
 }

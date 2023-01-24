@@ -56,8 +56,7 @@ mod tests {
 
     #[tokio::test]
     async fn can_record_log() {
-        //let mut c = open(Some("/tmp/analyzer-test".into())).await.unwrap();
-        let c = open(None).await.unwrap();
+        let c = open(Some("/tmp/mysql-slowlog-analyzer-test".into())).await.unwrap();
 
         let mut f = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
 

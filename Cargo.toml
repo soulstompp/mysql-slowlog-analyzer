@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 async-stream = "0.3.3"
 nom = "7.1.1"
-mysql-slowlog-parser = { git = "https://github.com/soulstompp/mysql-slowlog-parser", branch="0.1.0" }
+mysql-slowlog-parser = { git = "https://github.com/soulstompp/mysql-slowlog-parser", branch="development" }
 sqlx = {version = "0.6.2", features = ["json", "macros", "runtime-tokio-native-tls", "sqlite", "time"]}
 thiserror = "1.0.38"
 time = {version = "0.3.17", features = ["parsing"]}
