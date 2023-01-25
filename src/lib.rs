@@ -29,7 +29,7 @@ pub enum Error {
     SqlxError(#[from] sqlx::Error),
 }
 
-pub async fn record_log<'a>(c: SqlitePool, br: &'a mut dyn BufRead) -> Result<(), Error> {
+pub async fn record_log<'a>(c: &SqlitePool, br: &'a mut dyn BufRead) -> Result<(), Error> {
     let mut r = Reader::new(br, EntryMasking::PlaceHolder)?;
 
     let s = try_stream! {
@@ -48,7 +48,7 @@ pub async fn record_log<'a>(c: SqlitePool, br: &'a mut dyn BufRead) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use crate::db::open;
+    use crate::db::{open, select_summed_stats, StatList, StatsBySql, StatsByUser};
     use crate::record_log;
     use fs::File;
     use std::fs;
@@ -56,10 +56,20 @@ mod tests {
 
     #[tokio::test]
     async fn can_record_log() {
-        let c = open(Some("/tmp/mysql-slowlog-analyzer-test".into())).await.unwrap();
+        let c = open(Some("/tmp/mysql-slowlog-analyzer-test".into()))
+            .await
+            .unwrap();
 
         let mut f = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
 
-        record_log(c, &mut f).await.unwrap();
+        record_log(&c, &mut f).await.unwrap();
+
+        let stats: Vec<StatsBySql> = select_summed_stats(&c).await.unwrap();
+
+        println!("stats:\n{}", stats.display_vertical());
+
+        let stats: Vec<StatsByUser> = select_summed_stats(&c).await.unwrap();
+
+        println!("stats:\n{}", stats.display_vertical());
     }
 }

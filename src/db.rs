@@ -4,8 +4,9 @@ use core::str::FromStr;
 use mysql_slowlog_parser::EntryStatement::{AdminCommand, SqlStatement};
 use mysql_slowlog_parser::{Entry, EntryStatement};
 use serde_json::{json, Value};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::ops::AddAssign;
 use time::format_description::well_known::iso8601::Iso8601;
 use time::OffsetDateTime;
 
@@ -200,7 +201,6 @@ async fn insert_query_call(
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
-
 struct InsertQuerySessionParams {
     query_call_id: u32,
     user_name: String,
@@ -217,15 +217,16 @@ async fn insert_query_session(
     sqlx::query(
         "INSERT INTO query_call_session (query_call_id, user_name, sys_user_name, host_name,
         ip_address, thread_id)
-        VALUES (?, ?, ?, ?, ?, ?)")
+        VALUES (?, ?, ?, ?, ?, ?)",
+    )
     .bind(params.query_call_id)
     .bind(params.user_name)
     .bind(params.sys_user_name)
     .bind(params.host_name)
     .bind(params.ip_address)
     .bind(params.thread_id)
-        .execute(tx)
-        .await?;
+    .execute(tx)
+    .await?;
 
     Ok(())
 }
@@ -243,7 +244,7 @@ async fn insert_query_stats(
     params: InsertQueryStatsParams,
 ) -> Result<(), Error> {
     let _ = sqlx::query(
-    "INSERT INTO query_call_stats (query_call_id, query_time, lock_time, rows_sent, rows_examined)
+        "INSERT INTO query_call_stats (query_call_id, query_time, lock_time, rows_sent, rows_examined)
         VALUES (?, ?, ?, ?, ?)")
         .bind(params.query_call_id)
         .bind(&params.query_time)
@@ -275,4 +276,198 @@ async fn insert_query_details(
     .await?;
 
     Ok(())
+}
+
+macro_rules! stats_builder {
+    (
+     $sql:literal,
+     $(#[$meta:meta])*
+     $vis:vis struct $struct_name:ident {
+        $(
+        $(#[$field_meta:meta])*
+        $field_vis:vis $field_name:ident : $field_type:ty
+        ),*$(,)+
+    }
+    ) => {
+            $(#[$meta])*
+            pub struct $struct_name{
+                $(
+                $(#[$field_meta:meta])*
+                pub $field_name : $field_type,
+                )+
+                calls: u32,
+                query_time: f32,
+                lock_time: f32,
+                rows_sent: u32,
+                rows_examined: u32,
+            }
+
+            impl StatBuilder for $struct_name {
+                fn columns() -> Vec<String> {
+                    let mut acc = vec![];
+
+                    $(
+                      acc.push(stringify!($field_name).to_string());
+                    )*
+
+                    acc
+                }
+
+                fn filter_sql() -> &'static str {
+                    $sql
+                }
+
+                fn from_row(r: SqliteRow) -> Self {
+                    Self {
+                        $(
+                           $field_name: r.get(stringify!($field_name)),
+                        )*
+                        calls: r.get("calls"),
+                        query_time: r.get("query_time"),
+                        lock_time: r.get("lock_time"),
+                        rows_sent: r.get("rows_sent"),
+                        rows_examined: r.get("rows_examined"),
+                    }
+                }
+            }
+
+            impl StatList for Vec<$struct_name> {
+                fn display_vertical(&self) -> String {
+                    let (_, out) = self
+                        .iter()
+                        .fold((0, String::new()), |(mut i, mut acc), v| {
+                            i.add_assign(1);
+                            acc.push_str(
+                                format!(
+                                    "*************************** {}. row ***************************\n",
+                                    i
+                                )
+                                    .as_str(),
+                            );
+                        $(
+                           acc.push_str(format!("{}: {}\n", stringify!($field_name), v
+                           .$field_name).as_str());
+                        )*
+                            acc.push_str(format!("calls: {}\n", v.calls).as_str());
+                            acc.push_str(format!("query_time: {}\n", v.query_time).as_str());
+                            acc.push_str(format!("lock_time: {}\n", v.lock_time).as_str());
+                            acc.push_str(format!("rows_sent: {}\n", v.rows_sent).as_str());
+                            acc.push_str(format!("rows_examined: {}\n", v.rows_examined).as_str());
+
+                            (i, acc)
+                        });
+
+                    out
+                }
+
+            }
+    }
+}
+
+pub trait StatBuilder: Sized {
+    fn columns() -> Vec<String>;
+
+    fn filter_sql() -> &'static str;
+
+    fn column_list(prefix: Option<&str>) -> String {
+        let (_, out) = Self::columns()
+            .iter()
+            .fold((0, String::new()), |(mut i, mut acc), c| {
+                if i > 0 {
+                    acc.push_str(", ");
+                }
+
+                if let Some(p) = prefix {
+                    acc.push_str(format!("{}.", p).as_str())
+                }
+
+                acc.push_str(format!("{}", c).as_str());
+                i.add_assign(1);
+
+                (i, acc)
+            });
+
+        out
+    }
+
+    fn sum_stats_sql() -> String {
+        format!(
+            "
+    WITH stats AS (
+    {}
+    )
+    SELECT
+    {},
+    COUNT(stats.query_call_id) AS calls,
+    CAST(SUM(stats.query_time) AS REAL) AS query_time,
+    CAST(SUM(stats.lock_time) AS REAL) AS lock_time,
+    SUM(stats.rows_sent) AS rows_sent,
+    SUM(stats.rows_examined) AS rows_examined
+    FROM stats
+    GROUP BY {}",
+            Self::stats_by_filter_sql(),
+            Self::column_list(Some("stats")),
+            Self::column_list(Some("stats"))
+        )
+    }
+
+    fn stats_by_filter_sql() -> String {
+        format!(
+            r#"
+           WITH filter AS (
+           {}
+           )
+           SELECT {}, qcs.*
+           FROM
+           query_calls qc
+           JOIN filter f ON f.query_call_id = qc.id
+           JOIN query_call_stats qcs ON qcs.query_call_id = qc.id
+           "#,
+            Self::filter_sql(),
+            Self::column_list(Some("f"))
+        )
+    }
+
+    fn from_rows(r: Vec<SqliteRow>) -> Vec<Self> {
+        r.into_iter().map(|r| Self::from_row(r)).collect()
+    }
+
+    fn from_row(r: SqliteRow) -> Self;
+}
+
+pub trait StatList {
+    fn display_vertical(&self) -> String;
+}
+
+stats_builder! {
+    r#"
+        SELECT q.sql, qc.id AS query_call_id
+        FROM query_calls qc
+        JOIN queries q ON q.id = qc.query_id
+    "#,
+    #[derive(Debug)]
+    struct StatsBySql {
+        sql: String,
+    }
+}
+
+stats_builder! {
+    r#"
+        SELECT qs.user_name, qs.host_name, qc.id AS query_call_id
+        FROM query_calls qc
+        JOIN query_call_session qs ON qs.query_call_id = qc.id
+    "#,
+    #[derive(Debug)]
+    struct StatsByUser {
+        user_name: String,
+        host_name: String,
+    }
+}
+
+pub async fn select_summed_stats<S: StatBuilder>(c: &SqlitePool) -> Result<Vec<S>, Error> {
+    let sql = S::sum_stats_sql();
+
+    let rows = sqlx::query(&sql).fetch_all(c).await?;
+
+    Ok(S::from_rows(rows))
 }
