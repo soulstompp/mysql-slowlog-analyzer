@@ -48,7 +48,7 @@ pub async fn record_log<'a>(c: &SqlitePool, br: &'a mut dyn BufRead) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{open, select_summed_stats, StatList, StatsBySql, StatsByUser};
+    use crate::db::{open, query_stats, StatList, StatsByObject, StatsBySql, StatsByUser};
     use crate::record_log;
     use fs::File;
     use std::fs;
@@ -64,12 +64,16 @@ mod tests {
 
         record_log(&c, &mut f).await.unwrap();
 
-        let stats: Vec<StatsBySql> = select_summed_stats(&c).await.unwrap();
+        let stats: Vec<StatsBySql> = query_stats(&c).await.unwrap();
 
-        println!("stats:\n{}", stats.display_vertical());
+        println!("sql stats:\n{}", stats.display_vertical());
 
-        let stats: Vec<StatsByUser> = select_summed_stats(&c).await.unwrap();
+        let stats: Vec<StatsByUser> = query_stats(&c).await.unwrap();
 
-        println!("stats:\n{}", stats.display_vertical());
+        println!("user stats:\n{}", stats.display_vertical());
+
+        let stats: Vec<StatsByObject> = query_stats(&c).await.unwrap();
+
+        println!("object stats:\n{}", stats.display_vertical());
     }
 }

@@ -1,8 +1,9 @@
 use crate::Error;
+use core::borrow::BorrowMut;
 use core::fmt::{Display, Formatter};
 use core::str::FromStr;
 use mysql_slowlog_parser::EntryStatement::{AdminCommand, SqlStatement};
-use mysql_slowlog_parser::{Entry, EntryStatement};
+use mysql_slowlog_parser::{Entry, EntrySqlStatementObject, EntryStatement};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
@@ -75,13 +76,17 @@ pub async fn record_entry(c: SqlitePool, e: Entry) -> Result<u32, Error> {
 }
 
 pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<u32, Error> {
-    let (sql, details) = match e.statement() {
-        SqlStatement(s) => (s.statement.to_string(), Some(json!(s.details.clone()))),
-        EntryStatement::InvalidStatement(s) => (s.into(), None),
-        AdminCommand(ac) => (ac.command.to_string(), None),
+    let (sql, objects, details) = match e.statement() {
+        SqlStatement(s) => (
+            s.statement.to_string(),
+            Some(s.objects()),
+            Some(json!(s.details.clone())),
+        ),
+        EntryStatement::InvalidStatement(s) => (s.into(), None, None),
+        AdminCommand(ac) => (ac.command.to_string(), None, None),
     };
 
-    let query_id = insert_query(tx, InsertQueryParams { sql }).await?;
+    let query_id = insert_query(tx, InsertQueryParams { sql, objects }).await?;
 
     let query_call_id = insert_query_call(
         tx,
@@ -130,16 +135,39 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<
 
 struct InsertQueryParams {
     sql: String,
+    objects: Option<Vec<EntrySqlStatementObject>>,
 }
 
 async fn find_query(
     tx: &mut Transaction<'_, Sqlite>,
     params: &InsertQueryParams,
 ) -> Result<u32, Error> {
-    let r = sqlx::query("SELECT id FROM queries WHERE sql = ?")
+    let r = sqlx::query("SELECT id FROM db_ojects WHERE schema = ?")
         .bind(params.sql.to_string())
         .fetch_one(tx)
         .await?;
+
+    let id = r.try_get(0)?;
+
+    u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
+}
+
+async fn find_db_object(
+    tx: &mut Transaction<'_, Sqlite>,
+    schema: Option<String>,
+    object_name: String,
+) -> Result<u32, Error> {
+    let r = sqlx::query(
+        format!(
+            "SELECT id from db_objects WHERE table_name = ? AND schema name {}",
+            schema.clone().map_or("IS ?", |_| "= ?")
+        )
+        .as_str(),
+    )
+    .bind(object_name)
+    .bind(schema)
+    .fetch_one(tx)
+    .await?;
 
     let id = r.try_get(0)?;
 
@@ -156,6 +184,55 @@ async fn insert_query(
 
     let result = sqlx::query("INSERT INTO queries (sql) VALUES (?)")
         .bind(&params.sql)
+        .execute(tx.borrow_mut())
+        .await
+        .unwrap();
+
+    let id = result.last_insert_rowid();
+
+    let id = u32::try_from(id).or::<Error>(Err(InvalidPrimaryKey { value: id }.into()))?;
+
+    insert_query_objects(tx, id, params).await?;
+
+    Ok(id)
+}
+
+async fn insert_query_objects(
+    tx: &mut Transaction<'_, Sqlite>,
+    query_id: u32,
+    params: InsertQueryParams,
+) -> Result<(), Error> {
+    if let Some(l) = params.objects {
+        for o in l {
+            let db_object_id = insert_db_objects(tx, o).await?;
+
+            let _ = sqlx::query(
+                "INSERT INTO query_objects (query_id, db_object_id) VALUES \
+            (?, ?)",
+            )
+            .bind(query_id)
+            .bind(db_object_id)
+            .execute(tx.borrow_mut())
+            .await
+            .unwrap();
+        }
+    }
+
+    Ok(())
+}
+
+async fn insert_db_objects(
+    tx: &mut Transaction<'_, Sqlite>,
+    object: EntrySqlStatementObject,
+) -> Result<u32, Error> {
+    if let Ok(id) = find_db_object(tx, object.schema_name.clone(), object.object_name.clone()).await
+    {
+        return Ok(id);
+    }
+
+    let result = sqlx::query("INSERT INTO db_objects (schema_name, object_name) VALUES (?, ?)")
+        .bind(object.schema_name.clone())
+        .bind(object.object_name.clone())
         .execute(tx)
         .await
         .unwrap();
@@ -278,6 +355,7 @@ async fn insert_query_details(
     Ok(())
 }
 
+#[macro_export]
 macro_rules! stats_builder {
     (
      $sql:literal,
@@ -346,7 +424,7 @@ macro_rules! stats_builder {
                             );
                         $(
                            acc.push_str(format!("{}: {}\n", stringify!($field_name), v
-                           .$field_name).as_str());
+                           .$field_name.nullable_display()).as_str());
                         )*
                             acc.push_str(format!("calls: {}\n", v.calls).as_str());
                             acc.push_str(format!("query_time: {}\n", v.query_time).as_str());
@@ -464,7 +542,46 @@ stats_builder! {
     }
 }
 
-pub async fn select_summed_stats<S: StatBuilder>(c: &SqlitePool) -> Result<Vec<S>, Error> {
+stats_builder! {
+    r#"
+        SELECT do.schema_name, do.object_name, qc.id AS query_call_id
+        FROM db_objects do
+        JOIN query_objects qo ON qo.db_object_id = do.id
+        JOIN query_calls qc ON qc.query_id = qo.query_id
+    "#,
+    #[derive(Debug)]
+    struct StatsByObject {
+        schema_name: Option<String>,
+        object_name: String,
+    }
+}
+
+impl Display for dyn NullableDisplay {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.nullable_display())
+    }
+}
+
+trait NullableDisplay {
+    fn nullable_display(&self) -> String;
+}
+
+impl<T: NullableDisplay> NullableDisplay for Option<T> {
+    fn nullable_display(&self) -> String {
+        match self {
+            Some(v) => v.nullable_display(),
+            None => "NULL".to_string(),
+        }
+    }
+}
+
+impl NullableDisplay for String {
+    fn nullable_display(&self) -> String {
+        self.to_string()
+    }
+}
+
+pub async fn query_stats<S: StatBuilder>(c: &SqlitePool) -> Result<Vec<S>, Error> {
     let sql = S::sum_stats_sql();
 
     let rows = sqlx::query(&sql).fetch_all(c).await?;
