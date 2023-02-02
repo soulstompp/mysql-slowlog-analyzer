@@ -6,7 +6,7 @@ use mysql_slowlog_parser::EntryStatement::{AdminCommand, SqlStatement};
 use mysql_slowlog_parser::{Entry, EntrySqlStatementObject, EntryStatement};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
 use std::ops::AddAssign;
 use time::format_description::well_known::iso8601::Iso8601;
 use time::OffsetDateTime;
@@ -22,7 +22,7 @@ impl Display for InvalidPrimaryKey {
     }
 }
 
-pub async fn open(db: Option<String>) -> Result<SqlitePool, Error> {
+pub async fn open_db(db: Option<String>) -> Result<SqlitePool, Error> {
     let url = url(db);
 
     let pool_timeout = 30;
@@ -355,97 +355,12 @@ async fn insert_query_details(
     Ok(())
 }
 
-#[macro_export]
-macro_rules! stats_builder {
-    (
-     $sql:literal,
-     $(#[$meta:meta])*
-     $vis:vis struct $struct_name:ident {
-        $(
-        $(#[$field_meta:meta])*
-        $field_vis:vis $field_name:ident : $field_type:ty
-        ),*$(,)+
-    }
-    ) => {
-            $(#[$meta])*
-            pub struct $struct_name{
-                $(
-                $(#[$field_meta:meta])*
-                pub $field_name : $field_type,
-                )+
-                calls: u32,
-                query_time: f32,
-                lock_time: f32,
-                rows_sent: u32,
-                rows_examined: u32,
-            }
-
-            impl StatBuilder for $struct_name {
-                fn columns() -> Vec<String> {
-                    let mut acc = vec![];
-
-                    $(
-                      acc.push(stringify!($field_name).to_string());
-                    )*
-
-                    acc
-                }
-
-                fn filter_sql() -> &'static str {
-                    $sql
-                }
-
-                fn from_row(r: SqliteRow) -> Self {
-                    Self {
-                        $(
-                           $field_name: r.get(stringify!($field_name)),
-                        )*
-                        calls: r.get("calls"),
-                        query_time: r.get("query_time"),
-                        lock_time: r.get("lock_time"),
-                        rows_sent: r.get("rows_sent"),
-                        rows_examined: r.get("rows_examined"),
-                    }
-                }
-            }
-
-            impl StatList for Vec<$struct_name> {
-                fn display_vertical(&self) -> String {
-                    let (_, out) = self
-                        .iter()
-                        .fold((0, String::new()), |(mut i, mut acc), v| {
-                            i.add_assign(1);
-                            acc.push_str(
-                                format!(
-                                    "*************************** {}. row ***************************\n",
-                                    i
-                                )
-                                    .as_str(),
-                            );
-                        $(
-                           acc.push_str(format!("{}: {}\n", stringify!($field_name), v
-                           .$field_name.nullable_display()).as_str());
-                        )*
-                            acc.push_str(format!("calls: {}\n", v.calls).as_str());
-                            acc.push_str(format!("query_time: {}\n", v.query_time).as_str());
-                            acc.push_str(format!("lock_time: {}\n", v.lock_time).as_str());
-                            acc.push_str(format!("rows_sent: {}\n", v.rows_sent).as_str());
-                            acc.push_str(format!("rows_examined: {}\n", v.rows_examined).as_str());
-
-                            (i, acc)
-                        });
-
-                    out
-                }
-
-            }
-    }
+pub trait StatList {
+    fn display_vertical(&self) -> String;
 }
 
-pub trait StatBuilder: Sized {
+pub trait ColumnSet {
     fn columns() -> Vec<String>;
-
-    fn filter_sql() -> &'static str;
 
     fn column_list(prefix: Option<&str>) -> String {
         let (_, out) = Self::columns()
@@ -468,91 +383,191 @@ pub trait StatBuilder: Sized {
         out
     }
 
-    fn sum_stats_sql() -> String {
+    fn vertical_display_column_values(&self) -> String {
+        self.display_values()
+            .iter()
+            .fold(String::new(), |mut acc, (k, v)| {
+                acc.push_str(format!("{}: {}\n", k, v).as_str());
+                acc
+            })
+    }
+
+    fn display_values(&self) -> Vec<(&str, String)>;
+}
+
+pub trait Aggregate: ColumnSet + Sized {
+    fn sql(f_sql: String, f_cols: String, f_key: String) -> String;
+}
+
+#[derive(FromRow, Debug)]
+pub struct Stats {
+    calls: u32,
+    query_time: f32,
+    lock_time: f32,
+    rows_sent: u32,
+    rows_examined: u32,
+}
+
+impl Aggregate for Stats {
+    fn sql(f_sql: String, f_cols: String, f_key: String) -> String {
         format!(
             "
-    WITH stats AS (
-    {}
+    WITH filter AS (
+    {f_sql}
     )
     SELECT
-    {},
+    {f_cols},
     COUNT(stats.query_call_id) AS calls,
     CAST(SUM(stats.query_time) AS REAL) AS query_time,
     CAST(SUM(stats.lock_time) AS REAL) AS lock_time,
     SUM(stats.rows_sent) AS rows_sent,
     SUM(stats.rows_examined) AS rows_examined
-    FROM stats
-    GROUP BY {}",
-            Self::stats_by_filter_sql(),
-            Self::column_list(Some("stats")),
-            Self::column_list(Some("stats"))
+    FROM filter
+    JOIN query_call_stats stats ON stats.{f_key} = filter.{f_key}
+    GROUP BY {f_cols}",
+            f_cols = f_cols,
+            f_sql = f_sql,
+            f_key = f_key,
         )
     }
-
-    fn stats_by_filter_sql() -> String {
-        format!(
-            r#"
-           WITH filter AS (
-           {}
-           )
-           SELECT {}, qcs.*
-           FROM
-           query_calls qc
-           JOIN filter f ON f.query_call_id = qc.id
-           JOIN query_call_stats qcs ON qcs.query_call_id = qc.id
-           "#,
-            Self::filter_sql(),
-            Self::column_list(Some("f"))
-        )
-    }
-
-    fn from_rows(r: Vec<SqliteRow>) -> Vec<Self> {
-        r.into_iter().map(|r| Self::from_row(r)).collect()
-    }
-
-    fn from_row(r: SqliteRow) -> Self;
 }
 
-pub trait StatList {
-    fn display_vertical(&self) -> String;
-}
+impl ColumnSet for Stats {
+    fn columns() -> Vec<String> {
+        vec![
+            "calls".into(),
+            "query_time".into(),
+            "lock_time".into(),
+            "rows_sent".into(),
+            "rows_examined".into(),
+        ]
+    }
 
-stats_builder! {
-    r#"
-        SELECT q.sql, qc.id AS query_call_id
-        FROM query_calls qc
-        JOIN queries q ON q.id = qc.query_id
-    "#,
-    #[derive(Debug)]
-    struct StatsBySql {
-        sql: String,
+    fn display_values(&self) -> Vec<(&str, String)> {
+        let mut acc = vec![];
+
+        acc.push(("calls", self.calls.to_string()));
+        acc.push(("query_time", self.query_time.to_string()));
+        acc.push(("lock_time", self.lock_time.to_string()));
+        acc.push(("rows_sent", self.rows_sent.to_string()));
+        acc.push(("rows_examined", self.rows_examined.to_string()));
+
+        acc
     }
 }
 
-stats_builder! {
-    r#"
-        SELECT qs.user_name, qs.host_name, qc.id AS query_call_id
-        FROM query_calls qc
-        JOIN query_call_session qs ON qs.query_call_id = qc.id
-    "#,
-    #[derive(Debug)]
-    struct StatsByUser {
-        user_name: String,
-        host_name: String,
-    }
+/// ## Filter
+///
+/// Provides the an interface that allows a query that can be combined with Aggregate queries.
+///
+/// Requires the `Column` trait to be implemented as well.
+/// ```
+/// use mysql_slowlog_analyzer::db::{Filter, ColumnSet, Stats, StatList};
+/// use mysql_slowlog_analyzer::Error;
+///         use std::collections::BTreeMap;
+///
+/// use sqlx::sqlite::SqliteRow;
+/// use sqlx::Row;
+/// use sqlx::FromRow;
+///
+///#[derive(Debug)]
+///struct StatsBySql {
+///    sql: String,
+///    stats: Stats,
+///}
+///
+/// impl ColumnSet for StatsBySql {
+///     fn columns() -> Vec<String> {
+///         vec![
+///            "sql".into()
+///         ]
+///     }
+///
+///     fn display_values(&self) -> Vec<(&str, String)> {
+///         let mut acc = vec![];
+///
+///          acc.push(("sql", self.sql.to_string()));
+///
+///          acc.append(&mut self.stats.display_values());
+///
+///          acc
+///     }
+/// }
+///
+/// impl Filter for StatsBySql {
+///     fn sql() -> String {
+///        format!("
+///        SELECT q.sql, qc.id AS query_call_id
+///        FROM query_calls qc
+///        JOIN queries q ON q.id = qc.query_id
+///         ")
+///     }
+///
+///     fn key() -> String {
+///         format!("query_call_id")
+///     }
+///
+///     fn from_row(r: SqliteRow) -> Result<Self, Error> {
+/// Ok(Self {
+///            sql: r.try_get("sql")?,
+///            stats: Stats::from_row(&r)?,
+///     })
+///     }
+/// }
+///
+/// #[tokio::main]
+/// async fn main() {
+///     use std::fs::File;
+///     use std::io::BufReader;
+///     use mysql_slowlog_analyzer::db::{open_db, query_stat_report, Stats};
+///     use mysql_slowlog_analyzer::record_log;
+///     let c = open_db(None)
+///     .await
+///     .unwrap();
+///
+///     let mut f = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
+///
+///     record_log(&c, &mut f).await.unwrap();
+///
+///     let stats = query_stat_report::<StatsBySql, Stats>(&c).await.unwrap();
+///
+///     panic!("stats:\n{}", stats.display_vertical());
+/// }
+/// ```
+pub trait Filter: ColumnSet + Sized {
+    fn sql() -> String;
+
+    fn key() -> String;
+
+    fn from_row(r: SqliteRow) -> Result<Self, Error>;
 }
 
-stats_builder! {
-    r#"
-        SELECT do.schema_name, do.object_name, qc.id AS query_call_id
-        FROM db_objects do
-        JOIN query_objects qo ON qo.db_object_id = do.id
-        JOIN query_calls qc ON qc.query_id = qo.query_id
-    "#,
-    #[derive(Debug)]
-    struct StatsByObject {
-        schema_name: Option<String>,
-        object_name: String,
+#[derive(Debug)]
+pub struct RelationalObject<F: Filter> {
+    rows: Vec<F>,
+}
+
+impl<F: Filter> RelationalObject<F> {
+    pub fn display_vertical(&self) -> String {
+        let (_, out) = self
+            .rows
+            .iter()
+            .fold((0, String::new()), |(mut i, mut acc), v| {
+                i.add_assign(1);
+                acc.push_str(
+                    format!(
+                        "*************************** {}. row ***************************\n",
+                        i
+                    )
+                    .as_str(),
+                );
+
+                acc.push_str(v.vertical_display_column_values().as_str());
+
+                (i, acc)
+            });
+
+        out
     }
 }
 
@@ -581,10 +596,19 @@ impl NullableDisplay for String {
     }
 }
 
-pub async fn query_stats<S: StatBuilder>(c: &SqlitePool) -> Result<Vec<S>, Error> {
-    let sql = S::sum_stats_sql();
-
+pub async fn query_stat_report<F: Filter, A: Aggregate>(
+    c: &SqlitePool,
+) -> Result<RelationalObject<F>, Error> {
+    let sql = A::sql(F::sql(), F::column_list(Some("filter")), F::key());
+    println!("sql: {}", sql);
     let rows = sqlx::query(&sql).fetch_all(c).await?;
 
-    Ok(S::from_rows(rows))
+    let mut acc = vec![];
+
+    for r in rows.into_iter() {
+        let f = F::from_row(r)?;
+        acc.push(f);
+    }
+
+    Ok(RelationalObject { rows: acc })
 }
