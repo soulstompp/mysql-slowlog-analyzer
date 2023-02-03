@@ -76,17 +76,26 @@ pub async fn record_entry(c: SqlitePool, e: Entry) -> Result<u32, Error> {
 }
 
 pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<u32, Error> {
-    let (sql, objects, details) = match e.statement() {
+    let (sql, sql_type, objects, details) = match e.statement() {
         SqlStatement(s) => (
             s.statement.to_string(),
+            Some(s.entry_sql_type().to_string()),
             Some(s.objects()),
             Some(json!(s.details.clone())),
         ),
-        EntryStatement::InvalidStatement(s) => (s.into(), None, None),
-        AdminCommand(ac) => (ac.command.to_string(), None, None),
+        EntryStatement::InvalidStatement(s) => (s.into(), None, None, None),
+        AdminCommand(ac) => (ac.command.to_string(), None, None, None),
     };
 
-    let query_id = insert_query(tx, InsertQueryParams { sql, objects }).await?;
+    let query_id = insert_query(
+        tx,
+        InsertQueryParams {
+            sql,
+            sql_type,
+            objects,
+        },
+    )
+    .await?;
 
     let query_call_id = insert_query_call(
         tx,
@@ -135,6 +144,7 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<
 
 struct InsertQueryParams {
     sql: String,
+    sql_type: Option<String>,
     objects: Option<Vec<EntrySqlStatementObject>>,
 }
 
@@ -182,8 +192,9 @@ async fn insert_query(
         return Ok(id);
     }
 
-    let result = sqlx::query("INSERT INTO queries (sql) VALUES (?)")
+    let result = sqlx::query("INSERT INTO queries (sql, sql_type) VALUES (?, ?)")
         .bind(&params.sql)
+        .bind(&params.sql_type)
         .execute(tx.borrow_mut())
         .await
         .unwrap();
@@ -404,8 +415,8 @@ pub struct Stats {
     calls: u32,
     query_time: f32,
     lock_time: f32,
-    rows_sent: u32,
-    rows_examined: u32,
+    rows_sent: f32,
+    rows_examined: f32,
 }
 
 impl Aggregate for Stats {
@@ -418,10 +429,10 @@ impl Aggregate for Stats {
     SELECT
     {f_cols},
     COUNT(stats.query_call_id) AS calls,
-    CAST(SUM(stats.query_time) AS REAL) AS query_time,
-    CAST(SUM(stats.lock_time) AS REAL) AS lock_time,
-    SUM(stats.rows_sent) AS rows_sent,
-    SUM(stats.rows_examined) AS rows_examined
+    CAST(AVG(stats.query_time) AS REAL) AS query_time,
+    CAST(AVG(stats.lock_time) AS REAL) AS lock_time,
+    AVG(stats.rows_sent) AS rows_sent,
+    AVG(stats.rows_examined) AS rows_examined
     FROM filter
     JOIN query_call_stats stats ON stats.{f_key} = filter.{f_key}
     GROUP BY {f_cols}",
@@ -600,7 +611,6 @@ pub async fn query_stat_report<F: Filter, A: Aggregate>(
     c: &SqlitePool,
 ) -> Result<RelationalObject<F>, Error> {
     let sql = A::sql(F::sql(), F::column_list(Some("filter")), F::key());
-    println!("sql: {}", sql);
     let rows = sqlx::query(&sql).fetch_all(c).await?;
 
     let mut acc = vec![];
