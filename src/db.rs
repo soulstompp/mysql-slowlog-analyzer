@@ -6,7 +6,7 @@ use mysql_slowlog_parser::EntryStatement::{AdminCommand, SqlStatement};
 use mysql_slowlog_parser::{Entry, EntrySqlStatementObject, EntryStatement};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
-use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::ops::AddAssign;
 use time::format_description::well_known::iso8601::Iso8601;
 use time::OffsetDateTime;
@@ -366,12 +366,24 @@ async fn insert_query_details(
     Ok(())
 }
 
-pub trait StatList {
-    fn display_vertical(&self) -> String;
-}
+pub trait ColumnSet: Sized {
+    fn sql(s: &Option<SortingPlan>) -> String {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(Self::set_sql(s));
 
-pub trait ColumnSet {
+        if let Some(s) = s {
+            s.sql_clauses(&mut qb);
+        }
+
+        qb.into_sql()
+    }
+
+    fn set_sql(s: &Option<SortingPlan>) -> String;
+
+    fn from_row(r: SqliteRow) -> Result<Self, Error>;
+
     fn columns() -> Vec<String>;
+
+    fn key() -> String;
 
     fn column_list(prefix: Option<&str>) -> String {
         let (_, out) = Self::columns()
@@ -406,21 +418,17 @@ pub trait ColumnSet {
     fn display_values(&self) -> Vec<(&str, String)>;
 }
 
-pub trait Aggregate: ColumnSet + Sized {
-    fn sql(f_sql: String, f_cols: String, f_key: String) -> String;
-}
-
-#[derive(FromRow, Debug)]
-pub struct Stats {
+pub struct Stats<C> {
     calls: u32,
     query_time: f32,
     lock_time: f32,
     rows_sent: f32,
     rows_examined: f32,
+    filter: C,
 }
 
-impl Aggregate for Stats {
-    fn sql(f_sql: String, f_cols: String, f_key: String) -> String {
+impl<C: ColumnSet> ColumnSet for Stats<C> {
+    fn set_sql(_: &Option<SortingPlan>) -> String {
         format!(
             "
     WITH filter AS (
@@ -436,14 +444,22 @@ impl Aggregate for Stats {
     FROM filter
     JOIN query_call_stats stats ON stats.{f_key} = filter.{f_key}
     GROUP BY {f_cols}",
-            f_cols = f_cols,
-            f_sql = f_sql,
-            f_key = f_key,
+            f_cols = C::column_list(Some("filter")),
+            f_sql = C::set_sql(&None),
+            f_key = C::key(),
         )
     }
-}
 
-impl ColumnSet for Stats {
+    fn from_row(r: SqliteRow) -> Result<Self, Error> {
+        Ok(Self {
+            calls: r.try_get("calls")?,
+            query_time: r.try_get("query_time")?,
+            lock_time: r.try_get("lock_time")?,
+            rows_sent: r.try_get("rows_sent")?,
+            rows_examined: r.try_get("rows_examined")?,
+            filter: C::from_row(r)?,
+        })
+    }
     fn columns() -> Vec<String> {
         vec![
             "calls".into(),
@@ -454,9 +470,14 @@ impl ColumnSet for Stats {
         ]
     }
 
+    fn key() -> String {
+        "query_call_id".to_string()
+    }
+
     fn display_values(&self) -> Vec<(&str, String)> {
         let mut acc = vec![];
 
+        acc.append(&mut self.filter.display_values());
         acc.push(("calls", self.calls.to_string()));
         acc.push(("query_time", self.query_time.to_string()));
         acc.push(("lock_time", self.lock_time.to_string()));
@@ -467,13 +488,62 @@ impl ColumnSet for Stats {
     }
 }
 
-/// ## Filter
+pub struct Calls<F> {
+    calls: u32,
+    filter: F,
+}
+
+impl<C: ColumnSet> ColumnSet for Calls<C> {
+    fn set_sql(_: &Option<SortingPlan>) -> String {
+        format!(
+            "
+    WITH filter AS (
+    {f_sql}
+    )
+    SELECT
+    {f_cols},
+    COUNT(stats.query_call_id) AS calls
+    FROM filter
+    JOIN query_call_stats stats ON stats.{f_key} = filter.{f_key}
+    GROUP BY {f_cols}",
+            f_cols = C::column_list(Some("filter")),
+            f_sql = C::set_sql(&None),
+            f_key = C::key(),
+        )
+    }
+
+    fn from_row(r: SqliteRow) -> Result<Self, Error> {
+        Ok(Self {
+            calls: r.try_get("calls")?,
+            filter: C::from_row(r)?,
+        })
+    }
+
+    fn columns() -> Vec<String> {
+        vec!["calls".into()]
+    }
+
+    fn key() -> String {
+        "query_call_id".to_string()
+    }
+
+    fn display_values(&self) -> Vec<(&str, String)> {
+        let mut acc = vec![];
+
+        acc.append(&mut self.filter.display_values());
+        acc.push(("calls", self.calls.to_string()));
+
+        acc
+    }
+}
+
+/// ## query_column_set
 ///
-/// Provides the an interface that allows a query that can be combined with Aggregate queries.
+/// Runs sql for a columnset and fetches rows returning the rows as a RelationalObject
 ///
-/// Requires the `Column` trait to be implemented as well.
 /// ```
-/// use mysql_slowlog_analyzer::db::{Filter, ColumnSet, Stats, StatList};
+/// use mysql_slowlog_analyzer::{ColumnSet, OrderBy, Ordering,
+/// SortingPlan, Stats};
 /// use mysql_slowlog_analyzer::Error;
 ///         use std::collections::BTreeMap;
 ///
@@ -484,30 +554,12 @@ impl ColumnSet for Stats {
 ///#[derive(Debug)]
 ///struct StatsBySql {
 ///    sql: String,
-///    stats: Stats,
 ///}
 ///
 /// impl ColumnSet for StatsBySql {
-///     fn columns() -> Vec<String> {
-///         vec![
-///            "sql".into()
-///         ]
-///     }
-///
-///     fn display_values(&self) -> Vec<(&str, String)> {
-///         let mut acc = vec![];
-///
-///          acc.push(("sql", self.sql.to_string()));
-///
-///          acc.append(&mut self.stats.display_values());
-///
-///          acc
-///     }
-/// }
-///
-/// impl Filter for StatsBySql {
-///     fn sql() -> String {
-///        format!("
+///     fn set_sql(_: &Option<SortingPlan>) -> String {
+///        use mysql_slowlog_analyzer::db::SortingPlan;
+/// format!("
 ///        SELECT q.sql, qc.id AS query_call_id
 ///        FROM query_calls qc
 ///        JOIN queries q ON q.id = qc.query_id
@@ -519,10 +571,23 @@ impl ColumnSet for Stats {
 ///     }
 ///
 ///     fn from_row(r: SqliteRow) -> Result<Self, Error> {
-/// Ok(Self {
+///         Ok(Self {
 ///            sql: r.try_get("sql")?,
-///            stats: Stats::from_row(&r)?,
-///     })
+///         })
+///     }
+///
+///     fn columns() -> Vec<String> {
+///         vec![
+///            "sql".into()
+///         ]
+///     }
+///
+///     fn display_values(&self) -> Vec<(&str, String)> {
+///         let mut acc = vec![];
+///
+///          acc.push(("sql", self.sql.to_string()));
+///
+///          acc
 ///     }
 /// }
 ///
@@ -530,7 +595,7 @@ impl ColumnSet for Stats {
 /// async fn main() {
 ///     use std::fs::File;
 ///     use std::io::BufReader;
-///     use mysql_slowlog_analyzer::db::{open_db, query_stat_report, Stats};
+///     use mysql_slowlog_analyzer::db::{Limit, open_db, query_column_set, Stats};
 ///     use mysql_slowlog_analyzer::record_log;
 ///     let c = open_db(None)
 ///     .await
@@ -540,25 +605,26 @@ impl ColumnSet for Stats {
 ///
 ///     record_log(&c, &mut f).await.unwrap();
 ///
-///     let stats = query_stat_report::<StatsBySql, Stats>(&c).await.unwrap();
+///     let sorting = SortingPlan {
+///         order_by: Some(OrderBy { columns: vec![("calls".to_string(), Ordering::Desc)]}),
+///         limit: Some(Limit {
+///             limit: 5,
+///             offset: None
+///          })
+///     };
+///
+///     let stats = query_column_set::<Stats<StatsBySql>>(&c, Some(sorting)).await.unwrap();
 ///
 ///     panic!("stats:\n{}", stats.display_vertical());
 /// }
 /// ```
-pub trait Filter: ColumnSet + Sized {
-    fn sql() -> String;
-
-    fn key() -> String;
-
-    fn from_row(r: SqliteRow) -> Result<Self, Error>;
-}
 
 #[derive(Debug)]
-pub struct RelationalObject<F: Filter> {
-    rows: Vec<F>,
+pub struct RelationalObject<A> {
+    rows: Vec<A>,
 }
 
-impl<F: Filter> RelationalObject<F> {
+impl<C: ColumnSet> RelationalObject<C> {
     pub fn display_vertical(&self) -> String {
         let (_, out) = self
             .rows
@@ -607,16 +673,98 @@ impl NullableDisplay for String {
     }
 }
 
-pub async fn query_stat_report<F: Filter, A: Aggregate>(
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Ordering {
+    Asc,
+    Desc,
+}
+
+impl Default for Ordering {
+    fn default() -> Self {
+        Self::Asc
+    }
+}
+
+impl ToString for Ordering {
+    fn to_string(&self) -> String {
+        format!(
+            "{}",
+            match self {
+                Self::Asc => "ASC",
+                Self::Desc => "DESC",
+            }
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct OrderBy {
+    pub columns: Vec<(String, Ordering)>,
+}
+
+impl OrderBy {
+    fn sql_clause(&self, b: &mut QueryBuilder<Sqlite>) {
+        b.push("\nORDER BY ");
+
+        let mut seperated = b.separated(", ");
+
+        for c in &self.columns {
+            seperated.push(format!("{} {}", c.0, c.1.to_string()));
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Limit {
+    pub limit: u32,
+    pub offset: Option<u32>,
+}
+
+impl Limit {
+    fn sql_clause(&self, b: &mut QueryBuilder<Sqlite>) {
+        b.push("\nLIMIT");
+
+        let mut seperated = b.separated(",");
+
+        if let Some(o) = &self.offset {
+            seperated.push(format!(" {}", o));
+        }
+
+        seperated.push(&format!(" {}", self.limit));
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SortingPlan {
+    pub order_by: Option<OrderBy>,
+    pub limit: Option<Limit>,
+}
+
+impl SortingPlan {
+    fn sql_clauses(&self, b: &mut QueryBuilder<Sqlite>) {
+        if let Some(o) = &self.order_by {
+            o.sql_clause(b);
+        }
+
+        if let Some(l) = &self.limit {
+            l.sql_clause(b);
+        }
+    }
+}
+
+pub async fn query_column_set<C: ColumnSet>(
     c: &SqlitePool,
-) -> Result<RelationalObject<F>, Error> {
-    let sql = A::sql(F::sql(), F::column_list(Some("filter")), F::key());
+    s: Option<SortingPlan>,
+) -> Result<RelationalObject<C>, Error> {
+    let sql = C::sql(&s);
+
+    println!("sql: {}", sql);
     let rows = sqlx::query(&sql).fetch_all(c).await?;
 
     let mut acc = vec![];
 
     for r in rows.into_iter() {
-        let f = F::from_row(r)?;
+        let f = C::from_row(r)?;
         acc.push(f);
     }
 
