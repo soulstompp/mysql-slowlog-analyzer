@@ -1,11 +1,13 @@
 #[macro_use]
 extern crate alloc;
+extern crate core;
 
 pub mod db;
 
 #[doc(inline)]
 pub use crate::db::{
-    open_db, query_column_set, record_entry, ColumnSet, OrderBy, Ordering, RelationalObject,
+    open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
+    RelationalObject,
     SortingPlan, Stats,
 };
 use async_stream::try_stream;
@@ -24,6 +26,8 @@ pub enum Error {
     IO(#[from] std::io::Error),
     #[error("invalid primary key: {0}")]
     InvalidPrimaryKey(#[from] InvalidPrimaryKey),
+    #[error("invalid order by clause: {0}")]
+    InvalidOrderBy(String),
     #[error("migration error: {0}")]
     Migrate(#[from] MigrateError),
     #[error("parser error: {0}")]
@@ -51,9 +55,10 @@ pub async fn record_log<'a>(c: &SqlitePool, br: &'a mut dyn BufRead) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{Calls, Limit, OrderBy, Ordering, SortingPlan};
+    use crate::db::{Calls, Limit, OrderBy, OrderedColumn, SortingPlan};
     use crate::{open_db, query_column_set, ColumnSet, Stats};
     use crate::{record_log, Error};
+    use core::str::FromStr;
     use fs::File;
     use sqlx::sqlite::SqliteRow;
     use sqlx::Row;
@@ -77,18 +82,18 @@ mod tests {
             )
         }
 
-        fn key() -> String {
-            format!("query_call_id")
-        }
-
         fn from_row(r: SqliteRow) -> Result<Self, Error> {
             Ok(Self {
                 user_name: r.try_get("user_name")?,
                 host_name: r.try_get("host_name")?,
             })
         }
+
         fn columns() -> Vec<String> {
             vec!["user_name".into(), "host_name".into()]
+        }
+        fn key() -> String {
+            format!("query_call_id")
         }
 
         fn display_values(&self) -> Vec<(&str, String)> {
@@ -119,10 +124,6 @@ mod tests {
             )
         }
 
-        fn key() -> String {
-            format!("query_call_id")
-        }
-
         fn from_row(r: SqliteRow) -> Result<Self, Error> {
             Ok(Self {
                 schema_name: r.try_get("schema_name")?,
@@ -132,6 +133,10 @@ mod tests {
 
         fn columns() -> Vec<String> {
             vec!["schema_name".into(), "object_name".into()]
+        }
+
+        fn key() -> String {
+            format!("query_call_id")
         }
 
         fn display_values(&self) -> Vec<(&str, String)> {
@@ -174,7 +179,7 @@ mod tests {
 
         let sorting = SortingPlan {
             order_by: Some(OrderBy {
-                columns: vec![("calls".to_string(), Ordering::Desc)],
+                columns: vec![OrderedColumn::from_str("calls DESC").unwrap()],
             }),
             limit: Some(Limit {
                 limit: 5,

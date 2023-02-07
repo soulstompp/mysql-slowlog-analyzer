@@ -595,7 +595,8 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 /// async fn main() {
 ///     use std::fs::File;
 ///     use std::io::BufReader;
-///     use mysql_slowlog_analyzer::db::{Limit, open_db, query_column_set, Stats};
+///     use std::str::FromStr;
+///     use mysql_slowlog_analyzer::db::{Limit, open_db, OrderedColumn, query_column_set, Stats};
 ///     use mysql_slowlog_analyzer::record_log;
 ///     let c = open_db(None)
 ///     .await
@@ -606,7 +607,7 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 ///     record_log(&c, &mut f).await.unwrap();
 ///
 ///     let sorting = SortingPlan {
-///         order_by: Some(OrderBy { columns: vec![("calls".to_string(), Ordering::Desc)]}),
+///         order_by: Some(OrderBy { columns: vec![OrderedColumn::from_str("calls DESC").unwrap()] }),
 ///         limit: Some(Limit {
 ///             limit: 5,
 ///             offset: None
@@ -685,9 +686,10 @@ impl Default for Ordering {
     }
 }
 
-impl ToString for Ordering {
-    fn to_string(&self) -> String {
-        format!(
+impl Display for Ordering {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
             "{}",
             match self {
                 Self::Asc => "ASC",
@@ -697,9 +699,55 @@ impl ToString for Ordering {
     }
 }
 
+impl FromStr for Ordering {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "ASC" => Ok(Self::Asc),
+            "DESC" => Ok(Self::Desc),
+            _ => Err(Error::InvalidOrderBy(s.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct OrderedColumn {
+    column: String,
+    ordering: Ordering,
+}
+
+impl Display for OrderedColumn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} {}", self.column, self.ordering)
+    }
+}
+
+impl FromStr for OrderedColumn {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let v: Vec<&str> = s.split_whitespace().collect();
+
+        let column = v
+            .get(0)
+            .ok_or(Error::InvalidOrderBy(s.to_string()))?
+            .to_string();
+        let ordering = v.get(1);
+
+        Ok(Self {
+            column,
+            ordering: match ordering {
+                Some(o) => Ordering::from_str(o)?,
+                None => Ordering::Asc,
+            },
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct OrderBy {
-    pub columns: Vec<(String, Ordering)>,
+    pub columns: Vec<OrderedColumn>,
 }
 
 impl OrderBy {
@@ -709,7 +757,7 @@ impl OrderBy {
         let mut seperated = b.separated(", ");
 
         for c in &self.columns {
-            seperated.push(format!("{} {}", c.0, c.1.to_string()));
+            seperated.push(c.to_string());
         }
     }
 }
@@ -769,4 +817,42 @@ pub async fn query_column_set<C: ColumnSet>(
     }
 
     Ok(RelationalObject { rows: acc })
+}
+
+#[cfg(test)]
+mod test {
+    use crate::db::OrderedColumn;
+    use crate::Ordering;
+    use core::str::FromStr;
+
+    #[test]
+    fn ordering_parses() {
+        assert_eq!(Ordering::from_str("ASC").unwrap(), Ordering::Asc);
+        assert_eq!(Ordering::from_str("DESC").unwrap(), Ordering::Desc);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ordering_parses_invalid() {
+        Ordering::from_str("ASCC").unwrap();
+    }
+
+    #[test]
+    fn ordered_column_parsing() {
+        assert_eq!(
+            OrderedColumn::from_str("column_name").unwrap(),
+            OrderedColumn {
+                column: "column_name".to_string(),
+                ordering: Default::default()
+            }
+        );
+
+        assert_eq!(
+            OrderedColumn::from_str("column_name ASC").unwrap(),
+            OrderedColumn {
+                column: "column_name".to_string(),
+                ordering: Ordering::Asc,
+            }
+        );
+    }
 }
