@@ -47,13 +47,7 @@ pub async fn open_db(db: Option<String>) -> Result<SqlitePool, Error> {
         .connect_with(connection_options)
         .await?;
 
-    let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let migrations = std::path::Path::new(&crate_dir).join("./migrations");
-    let _ = sqlx::migrate::Migrator::new(migrations)
-        .await
-        .unwrap()
-        .run(&db)
-        .await?;
+    sqlx::migrate!("./migrations").run(&db).await?;
 
     Ok(db)
 }

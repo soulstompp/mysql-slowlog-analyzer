@@ -7,8 +7,7 @@ pub mod db;
 #[doc(inline)]
 pub use crate::db::{
     open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
-    RelationalObject,
-    SortingPlan, Stats,
+    RelationalObject, SortingPlan, Stats,
 };
 use async_stream::try_stream;
 use futures::TryStreamExt;
