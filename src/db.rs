@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::ops::AddAssign;
+use std::path::Path;
 use time::format_description::well_known::iso8601::Iso8601;
 use time::OffsetDateTime;
 
@@ -22,9 +23,7 @@ impl Display for InvalidPrimaryKey {
     }
 }
 
-pub async fn open_db(db: Option<String>) -> Result<SqlitePool, Error> {
-    let url = url(db);
-
+pub async fn open_db(p: Option<&Path>) -> Result<SqlitePool, Error> {
     let pool_timeout = 30;
     let concurrency = 50;
 
@@ -34,8 +33,7 @@ pub async fn open_db(db: Option<String>) -> Result<SqlitePool, Error> {
         concurrency as u32
     };
 
-    let connection_options = SqliteConnectOptions::from_str(&url)?
-        .create_if_missing(true)
+    let connection_options = SqliteConnectOptions::from_str(&db_url(p))?
         //    .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .serialized(true)
@@ -52,9 +50,9 @@ pub async fn open_db(db: Option<String>) -> Result<SqlitePool, Error> {
     Ok(db)
 }
 
-pub fn url(p: Option<String>) -> String {
+pub fn db_url(p: Option<&Path>) -> String {
     match p {
-        Some(p) => format!("sqlite://{}", p),
+        Some(p) => format!("sqlite://{}", p.to_string_lossy()),
         None => format!("sqlite://:memory:"),
     }
 }
@@ -412,6 +410,7 @@ pub trait ColumnSet: Sized {
     fn display_values(&self) -> Vec<(&str, String)>;
 }
 
+#[derive(PartialEq)]
 pub struct Stats<C> {
     calls: u32,
     query_time: f32,
@@ -587,18 +586,29 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     use std::fs::File;
+///     use std::fs::{File, metadata, remove_dir_all};
 ///     use std::io::BufReader;
+///     use std::path::PathBuf;
 ///     use std::str::FromStr;
 ///     use mysql_slowlog_analyzer::db::{Limit, open_db, OrderedColumn, query_column_set, Stats};
-///     use mysql_slowlog_analyzer::record_log;
-///     let c = open_db(None)
-///     .await
-///     .unwrap();
+///     use mysql_slowlog_analyzer::{LogData, LogDataConfig};
 ///
-///     let mut f = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
+///     let data_dir = PathBuf::from("/tmp/mysql_slowlog_stats_by_sql_doc");
 ///
-///     record_log(&c, &mut f).await.unwrap();
+///     if metadata(&data_dir).is_ok() {
+///         remove_dir_all(&data_dir).unwrap();
+///     }
+///
+///     let p = PathBuf::from("data/slow-test-queries.log");
+///
+///     let context = LogDataConfig {
+///         data_path: Some(data_dir),
+///     };
+///
+///     let mut s = LogData::open(&p, context).await.unwrap();
+///     s.record().await.unwrap();
+///
+///     let c = s.db_pool();
 ///
 ///     let sorting = SortingPlan {
 ///         order_by: Some(OrderBy { columns: vec![OrderedColumn::from_str("calls DESC").unwrap()] }),

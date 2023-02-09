@@ -3,6 +3,11 @@ extern crate alloc;
 extern crate core;
 
 pub mod db;
+mod dirs;
+
+use core::borrow::Borrow;
+use std::fs::File;
+use std::io;
 
 #[doc(inline)]
 pub use crate::db::{
@@ -12,15 +17,24 @@ pub use crate::db::{
 use async_stream::try_stream;
 use futures::TryStreamExt;
 use mysql_slowlog_parser::{EntryMasking, ReadError, Reader};
-use sqlx::migrate::MigrateError;
-use sqlx::SqlitePool;
-use std::io::BufRead;
+use sha2::{Digest, Sha256};
+use sqlx::migrate::{MigrateDatabase, MigrateError};
+use sqlx::{Sqlite, SqlitePool};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio::fs::create_dir_all;
 
+use crate::db::db_url;
+use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("this log has already recorded, delete the corresponding directoru to record again")]
+    LogAlreadyRecorded,
+    #[error("{0}")]
+    DirError(#[from] DirError),
     #[error("io error: {0}")]
     IO(#[from] std::io::Error),
     #[error("invalid primary key: {0}")]
@@ -35,34 +49,131 @@ pub enum Error {
     SqlxError(#[from] sqlx::Error),
 }
 
-pub async fn record_log<'a>(c: &SqlitePool, br: &'a mut dyn BufRead) -> Result<(), Error> {
-    let mut r = Reader::new(br, EntryMasking::PlaceHolder)?;
+pub struct LogData {
+    path: PathBuf,
+    hash: String,
+    pool: SqlitePool,
+    config: LogDataConfig,
+    context: LogDataContext,
+}
 
-    let s = try_stream! {
-        while let Some(e) = r.read_entry()? {
-            yield e;
+impl LogData {
+    pub async fn open(p: &Path, config: LogDataConfig) -> Result<Self, Error> {
+        let mut context = LogDataContext::default();
+
+        let mut f = File::open(&p)?;
+        let mut hash = Sha256::default();
+
+        io::copy(&mut f, &mut hash)?;
+
+        let hash = format!("{:x}", hash.finalize());
+
+        let dirs = SourceDataDir {
+            hash: hash.to_string(),
+            data_dir: config
+                .data_path
+                .as_ref()
+                .and_then(|p| Some(p.to_path_buf())),
+        };
+
+        let sqlitep = dirs.sqlite_dir()?;
+
+        create_dir_all(&sqlitep).await?;
+
+        let mut dbp = sqlitep.clone();
+        dbp.push("entries");
+
+        let db_url = db_url(Some(&dbp));
+
+        if Sqlite::database_exists(&db_url).await? {
+            context.db_recorded = true;
+        } else {
+            Sqlite::create_database(&db_url).await?;
         }
-    };
 
-    s.try_for_each(|e| async {
-        let _ = record_entry(c.clone(), e).await?;
+        let pool = open_db(Some(&dbp)).await?;
+
+        Ok(Self {
+            path: p.to_path_buf(),
+            hash: hash.to_string(),
+            pool,
+            config,
+            context,
+        })
+    }
+
+    pub async fn record(&mut self) -> Result<(), Error> {
+        if self.context.db_recorded {
+            return Err(Error::LogAlreadyRecorded);
+        }
+
+        let mut br = self.reader()?;
+
+        let mut r = Reader::new(br.by_ref(), EntryMasking::PlaceHolder)?;
+
+        let c = self.db_pool();
+
+        let s = try_stream! {
+            while let Some(e) = r.read_entry()? {
+                yield e;
+            }
+        };
+
+        let _: Result<(), Error> = s
+            .try_for_each(|e| async {
+                let _ = record_entry(c.clone(), e).await?;
+
+                Ok(())
+            })
+            .await;
+
+        self.context.db_recorded = true;
 
         Ok(())
-    })
-    .await
+    }
+
+    pub fn db_pool(&self) -> &SqlitePool {
+        self.pool.borrow()
+    }
+
+    fn dirs(&self) -> SourceDataDir {
+        SourceDataDir {
+            hash: self.hash.to_string(),
+            data_dir: self
+                .config
+                .data_path
+                .as_ref()
+                .and_then(|p| Some(p.to_path_buf())),
+        }
+    }
+
+    fn reader(&self) -> Result<BufReader<File>, Error> {
+        Ok(BufReader::new(File::open(&self.path)?))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LogDataConfig {
+    pub data_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+pub struct LogDataContext {
+    config: LogDataConfig,
+    db_recorded: bool,
+    aliases: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use crate::db::{Calls, Limit, OrderBy, OrderedColumn, SortingPlan};
-    use crate::{open_db, query_column_set, ColumnSet, Stats};
-    use crate::{record_log, Error};
+    use crate::Error;
+    use crate::{query_column_set, ColumnSet, LogData, LogDataConfig, Stats};
     use core::str::FromStr;
-    use fs::File;
     use sqlx::sqlite::SqliteRow;
     use sqlx::Row;
-    use std::fs;
-    use std::io::BufReader;
+    use std::fs::{metadata, remove_dir_all};
+    use std::path::PathBuf;
 
     #[derive(Debug)]
     struct StatsByUser {
@@ -156,13 +267,23 @@ mod tests {
 
     #[tokio::test]
     async fn can_record_log() {
-        let c = open_db(Some("/tmp/mysql-slowlog-analyzer-test".into()))
-            .await
-            .unwrap();
+        let p = PathBuf::from("data/slow-test-queries.log");
 
-        let mut f = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
+        let data_dir = PathBuf::from("/tmp/can_record_log");
 
-        record_log(&c, &mut f).await.unwrap();
+        if metadata(&data_dir).is_ok() {
+            remove_dir_all(&data_dir).unwrap();
+        }
+
+        let context = LogDataConfig {
+            data_path: Some(data_dir),
+        };
+
+        let mut s = LogData::open(&p, context).await.unwrap();
+
+        s.record().await.unwrap();
+
+        let c = s.db_pool();
 
         let stats = query_column_set::<Stats<StatsByUser>>(&c, None)
             .await
