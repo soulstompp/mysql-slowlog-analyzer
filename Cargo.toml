@@ -2,18 +2,18 @@
 name = "mysql-slowlog-analyzer"
 version = "0.1.0"
 edition = "2021"
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-compat = "0.2.1"
 async-stream = "0.3.3"
 directories = "4.0.1"
 nom = "7.1.1"
 mysql-slowlog-parser = { git = "https://github.com/soulstompp/mysql-slowlog-parser", branch="development" }
+polars = { version = "0.26.1", features = ["parquet"] }
 sha2 = "0.10.6"
-sqlx = {version = "0.6.2", features = ["json", "macros", "runtime-tokio-native-tls", "sqlite", "time"]}
+sqlx = {version = "0.6.2", features = ["macros", "runtime-tokio-native-tls", "sqlite", "time"]}
 thiserror = "1.0.38"
 time = {version = "0.3.17", features = ["parsing"]}
-serde_json = "1.0.91"
-tokio = {version = "1.24.1", features = ["full"]}
+tokio = {version = "1.24.1", features = ["macros", "test-util"]}
 futures = "0.3.25"

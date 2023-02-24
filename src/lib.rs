@@ -1,33 +1,50 @@
+#![feature(associated_type_defaults)]
 #[macro_use]
 extern crate alloc;
 extern crate core;
 
+mod arrow2;
 pub mod db;
 mod dirs;
+pub mod types;
 
-use core::borrow::Borrow;
-use std::fs::File;
-use std::io;
+use core::borrow::{Borrow, BorrowMut};
+use std::{fs, io};
+
+use async_compat::CompatExt;
+use tokio::fs::File;
+
+use ::polars::error::{ArrowError, PolarsError};
+
+use ::polars::export::arrow::chunk::Chunk;
+use futures::{pin_mut, SinkExt, StreamExt, TryStreamExt};
 
 #[doc(inline)]
 pub use crate::db::{
     open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
-    RelationalObject, SortingPlan, Stats,
+    RelationalObject, SortingPlan,
 };
 use async_stream::try_stream;
-use futures::TryStreamExt;
-use mysql_slowlog_parser::{EntryMasking, ReadError, Reader};
+use mysql_slowlog_parser::{Entry, EntryMasking, ReadError, Reader, ReaderBuildError};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateDatabase, MigrateError};
 use sqlx::{Sqlite, SqlitePool};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+
 use thiserror::Error;
 use tokio::fs::create_dir_all;
 
+use crate::arrow2::write_options;
 use crate::db::db_url;
 use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
+
+use crate::types::QueryEntry;
+use fs::File as StdFile;
+use polars::export::arrow::io::parquet::write::FileSink;
+#[doc(inline)]
+pub use types::Stats;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -43,15 +60,21 @@ pub enum Error {
     InvalidOrderBy(String),
     #[error("migration error: {0}")]
     Migrate(#[from] MigrateError),
-    #[error("parser error: {0}")]
-    Parser(#[from] ReadError),
+    #[error("reader error: {0}")]
+    Reader(#[from] ReadError),
+    #[error("reader build error: {0}")]
+    ReaderBuild(#[from] ReaderBuildError),
     #[error("db error: {0}")]
     SqlxError(#[from] sqlx::Error),
+    #[error("polars error: {0}")]
+    PolarsError(#[from] PolarsError),
+    #[error("arrow error: {0}")]
+    ArrowError(#[from] ArrowError),
 }
 
 pub struct LogData {
     path: PathBuf,
-    hash: String,
+    dirs: SourceDataDir,
     pool: SqlitePool,
     config: LogDataConfig,
     context: LogDataContext,
@@ -61,20 +84,7 @@ impl LogData {
     pub async fn open(p: &Path, config: LogDataConfig) -> Result<Self, Error> {
         let mut context = LogDataContext::default();
 
-        let mut f = File::open(&p)?;
-        let mut hash = Sha256::default();
-
-        io::copy(&mut f, &mut hash)?;
-
-        let hash = format!("{:x}", hash.finalize());
-
-        let dirs = SourceDataDir {
-            hash: hash.to_string(),
-            data_dir: config
-                .data_path
-                .as_ref()
-                .and_then(|p| Some(p.to_path_buf())),
-        };
+        let dirs = Self::data_dir(p, &config).await?;
 
         let sqlitep = dirs.sqlite_dir()?;
 
@@ -95,21 +105,44 @@ impl LogData {
 
         Ok(Self {
             path: p.to_path_buf(),
-            hash: hash.to_string(),
+            dirs,
             pool,
             config,
             context,
         })
     }
 
-    pub async fn record(&mut self) -> Result<(), Error> {
+    async fn data_dir(p: &Path, config: &LogDataConfig) -> Result<SourceDataDir, Error> {
+        let f = File::open(&p).await?;
+
+        let mut hash = Sha256::default();
+
+        io::copy(&mut f.into_std().await, &mut hash)?;
+
+        let hash = format!("{:x}", hash.finalize());
+
+        let dirs = SourceDataDir {
+            hash: hash.to_string(),
+            data_dir: config
+                .data_path
+                .as_ref()
+                .and_then(|p| Some(p.to_path_buf())),
+        };
+
+        Ok(dirs)
+    }
+
+    pub async fn record_db(&mut self) -> Result<(), Error> {
         if self.context.db_recorded {
             return Err(Error::LogAlreadyRecorded);
         }
 
-        let mut br = self.reader()?;
+        let mut br = self.reader().await?;
 
-        let mut r = Reader::new(br.by_ref(), EntryMasking::PlaceHolder)?;
+        let mut r = Reader::builder()
+            .reader(br.by_ref())
+            .masking(EntryMasking::PlaceHolder)
+            .build()?;
 
         let c = self.db_pool();
 
@@ -132,23 +165,54 @@ impl LogData {
         Ok(())
     }
 
+    pub async fn record_parquet(&mut self) -> Result<(), Error> {
+        let buffer = File::create(self.dirs.parquet_dir()?).await?;
+
+        let mut sink = FileSink::try_new(
+            buffer.compat(),
+            QueryEntry::arrow2_schema(),
+            QueryEntry::encodings(),
+            write_options(),
+        )?;
+
+        let mut br = self.reader().await?;
+
+        let mut r = Reader::builder()
+            .reader(br.by_ref())
+            .masking(EntryMasking::PlaceHolder)
+            .build()?;
+
+        let s = try_stream! {
+            while let Some(e) = r.read_entry()? {
+                yield e;
+            }
+        };
+
+        pin_mut!(s);
+
+        while let Some(res) = s.next().await {
+            let e: Result<Entry, Error> = res;
+
+            let e = QueryEntry::from(e?);
+
+            let arrays = e.arrow2_arrays();
+            sink.borrow_mut().feed(Chunk::new(arrays)).await?;
+        }
+
+        sink.close().await?;
+        drop(sink);
+
+        Ok(())
+    }
+
     pub fn db_pool(&self) -> &SqlitePool {
         self.pool.borrow()
     }
 
-    fn dirs(&self) -> SourceDataDir {
-        SourceDataDir {
-            hash: self.hash.to_string(),
-            data_dir: self
-                .config
-                .data_path
-                .as_ref()
-                .and_then(|p| Some(p.to_path_buf())),
-        }
-    }
-
-    fn reader(&self) -> Result<BufReader<File>, Error> {
-        Ok(BufReader::new(File::open(&self.path)?))
+    pub async fn reader(&self) -> Result<BufReader<StdFile>, Error> {
+        Ok(BufReader::new(
+            File::open(&self.path).await?.into_std().await,
+        ))
     }
 }
 
@@ -166,9 +230,9 @@ pub struct LogDataContext {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{Calls, Limit, OrderBy, OrderedColumn, SortingPlan};
+    use crate::db::{AggregateStats, Calls, Limit, OrderBy, OrderedColumn, SortingPlan};
     use crate::Error;
-    use crate::{query_column_set, ColumnSet, LogData, LogDataConfig, Stats};
+    use crate::{query_column_set, ColumnSet, LogData, LogDataConfig};
     use core::str::FromStr;
     use sqlx::sqlite::SqliteRow;
     use sqlx::Row;
@@ -176,12 +240,12 @@ mod tests {
     use std::path::PathBuf;
 
     #[derive(Debug)]
-    struct StatsByUser {
+    struct FilterUser {
         user_name: String,
         host_name: String,
     }
 
-    impl ColumnSet for StatsByUser {
+    impl ColumnSet for FilterUser {
         fn set_sql(_: &Option<SortingPlan>) -> String {
             format!(
                 r#"
@@ -200,8 +264,9 @@ mod tests {
         }
 
         fn columns() -> Vec<String> {
-            vec!["user_name".into(), "host_name".into()]
+            vec!["user_name".to_string(), "host_name".to_string()]
         }
+
         fn key() -> String {
             format!("query_call_id")
         }
@@ -217,12 +282,12 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct StatsByObject {
+    struct FilterObject {
         schema_name: Option<String>,
         object_name: String,
     }
 
-    impl ColumnSet for StatsByObject {
+    impl ColumnSet for FilterObject {
         fn set_sql(_: &Option<SortingPlan>) -> String {
             format!(
                 r#"
@@ -266,10 +331,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn can_record_log() {
+    async fn can_record_parquet() {
         let p = PathBuf::from("data/slow-test-queries.log");
 
-        let data_dir = PathBuf::from("/tmp/can_record_log");
+        let data_dir = PathBuf::from("/tmp/can_record_parquet");
 
         if metadata(&data_dir).is_ok() {
             remove_dir_all(&data_dir).unwrap();
@@ -281,17 +346,36 @@ mod tests {
 
         let mut s = LogData::open(&p, context).await.unwrap();
 
-        s.record().await.unwrap();
+        s.record_parquet().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn can_record_db() {
+        let p = PathBuf::from("data/slow-test-queries.log");
+
+        let data_dir = PathBuf::from("/tmp/can_record_db");
+
+        if metadata(&data_dir).is_ok() {
+            remove_dir_all(&data_dir).unwrap();
+        }
+
+        let context = LogDataConfig {
+            data_path: Some(data_dir),
+        };
+
+        let mut s = LogData::open(&p, context).await.unwrap();
+
+        s.record_db().await.unwrap();
 
         let c = s.db_pool();
 
-        let stats = query_column_set::<Stats<StatsByUser>>(&c, None)
+        let stats = query_column_set::<AggregateStats<FilterUser>>(&c, None)
             .await
             .unwrap();
 
         println!("user stats:\n{}", stats.display_vertical());
 
-        let stats = query_column_set::<Calls<StatsByUser>>(&c, None)
+        let stats = query_column_set::<Calls<FilterUser>>(&c, None)
             .await
             .unwrap();
 
@@ -307,13 +391,13 @@ mod tests {
             }),
         };
 
-        let stats = query_column_set::<Stats<StatsByObject>>(&c, Some(sorting.clone()))
+        let stats = query_column_set::<AggregateStats<FilterObject>>(&c, Some(sorting.clone()))
             .await
             .unwrap();
 
         println!("object stats:\n{}", stats.display_vertical());
 
-        let stats = query_column_set::<Calls<StatsByObject>>(&c, Some(sorting))
+        let stats = query_column_set::<Calls<FilterObject>>(&c, Some(sorting))
             .await
             .unwrap();
 

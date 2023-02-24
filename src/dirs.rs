@@ -14,6 +14,7 @@ fn project_dirs() -> Result<ProjectDirs, Error> {
         .ok_or(DirError::UnableToCreateProjectDir.into())
 }
 
+#[derive(Clone)]
 pub struct SourceDataDir {
     pub hash: String,
     pub data_dir: Option<PathBuf>,
