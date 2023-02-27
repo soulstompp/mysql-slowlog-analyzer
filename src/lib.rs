@@ -9,7 +9,7 @@ mod dirs;
 pub mod types;
 
 use core::borrow::{Borrow, BorrowMut};
-use std::{fs, io};
+use std::io;
 
 use async_compat::CompatExt;
 use tokio::fs::File;
@@ -17,20 +17,19 @@ use tokio::fs::File;
 use ::polars::error::{ArrowError, PolarsError};
 
 use ::polars::export::arrow::chunk::Chunk;
-use futures::{pin_mut, SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 
 #[doc(inline)]
 pub use crate::db::{
     open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
     RelationalObject, SortingPlan,
 };
-use async_stream::try_stream;
 use mysql_slowlog_parser::{Entry, EntryMasking, ReadError, Reader, ReaderBuildError};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateDatabase, MigrateError};
 use sqlx::{Sqlite, SqlitePool};
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncRead, BufReader};
 
 use thiserror::Error;
 use tokio::fs::create_dir_all;
@@ -41,7 +40,6 @@ use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
 
 use crate::types::QueryEntry;
-use fs::File as StdFile;
 use polars::export::arrow::io::parquet::write::FileSink;
 #[doc(inline)]
 pub use types::Stats;
@@ -132,33 +130,34 @@ impl LogData {
         Ok(dirs)
     }
 
+    pub fn parquet_dir(&self) -> Result<PathBuf, Error> {
+        self.dirs.parquet_dir()
+    }
+
+    pub fn sqllite_dir(&self) -> Result<PathBuf, Error> {
+        self.dirs.sqlite_dir()
+    }
+
     pub async fn record_db(&mut self) -> Result<(), Error> {
         if self.context.db_recorded {
             return Err(Error::LogAlreadyRecorded);
         }
 
-        let mut br = self.reader().await?;
+        let br = self.reader().await?;
 
         let mut r = Reader::builder()
-            .reader(br.by_ref())
+            .reader(br)
             .masking(EntryMasking::PlaceHolder)
             .build()?;
 
         let c = self.db_pool();
 
-        let s = try_stream! {
-            while let Some(e) = r.read_entry()? {
-                yield e;
-            }
-        };
+        let s = r.read_entries();
+        let mut s = Box::pin(s);
 
-        let _: Result<(), Error> = s
-            .try_for_each(|e| async {
-                let _ = record_entry(c.clone(), e).await?;
-
-                Ok(())
-            })
-            .await;
+        while let Some(e) = s.try_next().await? {
+            let _ = record_entry(c.clone(), e).await?;
+        }
 
         self.context.db_recorded = true;
 
@@ -166,40 +165,42 @@ impl LogData {
     }
 
     pub async fn record_parquet(&mut self) -> Result<(), Error> {
-        let buffer = File::create(self.dirs.parquet_dir()?).await?;
+        let mut buffer = File::create(self.dirs.parquet_dir().unwrap())
+            .await
+            .unwrap();
 
         let mut sink = FileSink::try_new(
-            buffer.compat(),
+            buffer.compat_mut(),
             QueryEntry::arrow2_schema(),
             QueryEntry::encodings(),
             write_options(),
-        )?;
+        )
+        .unwrap()
+        .buffer(1000);
 
-        let mut br = self.reader().await?;
+        let br = self.reader().await.unwrap();
 
         let mut r = Reader::builder()
-            .reader(br.by_ref())
+            .reader(br)
             .masking(EntryMasking::PlaceHolder)
-            .build()?;
+            .build()
+            .unwrap();
 
-        let s = try_stream! {
-            while let Some(e) = r.read_entry()? {
-                yield e;
-            }
-        };
+        let s = r
+            .read_entries()
+            .map(|res: Result<Entry, ReadError>| match res {
+                Ok(e) => {
+                    let e = QueryEntry::from(e);
 
-        pin_mut!(s);
+                    Ok(Chunk::new(e.arrow2_arrays()))
+                }
+                Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
+            });
 
-        while let Some(res) = s.next().await {
-            let e: Result<Entry, Error> = res;
+        let mut s = Box::pin(s);
+        sink.borrow_mut().buffer(10).send_all(&mut s).await.unwrap();
 
-            let e = QueryEntry::from(e?);
-
-            let arrays = e.arrow2_arrays();
-            sink.borrow_mut().feed(Chunk::new(arrays)).await?;
-        }
-
-        sink.close().await?;
+        sink.close().await.unwrap();
         drop(sink);
 
         Ok(())
@@ -209,10 +210,8 @@ impl LogData {
         self.pool.borrow()
     }
 
-    pub async fn reader(&self) -> Result<BufReader<StdFile>, Error> {
-        Ok(BufReader::new(
-            File::open(&self.path).await?.into_std().await,
-        ))
+    pub async fn reader(&self) -> Result<BufReader<impl AsyncRead>, Error> {
+        Ok(BufReader::new(File::open(&self.path).await?))
     }
 }
 
