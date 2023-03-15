@@ -9,7 +9,9 @@ mod dirs;
 pub mod types;
 
 use core::borrow::{Borrow, BorrowMut};
+use std::collections::VecDeque;
 use std::io;
+use std::ops::AddAssign;
 
 use async_compat::CompatExt;
 use tokio::fs::File;
@@ -17,18 +19,20 @@ use tokio::fs::File;
 use ::polars::error::{ArrowError, PolarsError};
 
 use ::polars::export::arrow::chunk::Chunk;
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, pin_mut, SinkExt, StreamExt, TryStreamExt};
 
 #[doc(inline)]
 pub use crate::db::{
     open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
     RelationalObject, SortingPlan,
 };
-use mysql_slowlog_parser::{Entry, EntryMasking, ReadError, Reader, ReaderBuildError};
+use mysql_slowlog_parser::{CodecError, Entry, EntryCodec, EntryMasking, ReadError};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateDatabase, MigrateError};
 use sqlx::{Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
+use polars::export::arrow::datatypes::DataType;
+use polars::export::arrow::io::parquet::read::ParquetError;
 use tokio::io::{AsyncRead, BufReader};
 
 use thiserror::Error;
@@ -40,7 +44,9 @@ use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
 
 use crate::types::QueryEntry;
-use polars::export::arrow::io::parquet::write::FileSink;
+use polars::export::arrow::io::parquet::write::{array_to_columns, compress, CompressedPage, DynIter, DynStreamingIterator, Encoding, FileSink, to_parquet_schema, transverse};
+use polars::export::rayon::prelude::IntoParallelRefIterator;
+use tokio_util::codec::FramedRead;
 #[doc(inline)]
 pub use types::Stats;
 
@@ -60,8 +66,6 @@ pub enum Error {
     Migrate(#[from] MigrateError),
     #[error("reader error: {0}")]
     Reader(#[from] ReadError),
-    #[error("reader build error: {0}")]
-    ReaderBuild(#[from] ReaderBuildError),
     #[error("db error: {0}")]
     SqlxError(#[from] sqlx::Error),
     #[error("polars error: {0}")]
@@ -143,20 +147,16 @@ impl LogData {
             return Err(Error::LogAlreadyRecorded);
         }
 
-        let br = self.reader().await?;
-
-        let mut r = Reader::builder()
-            .reader(br)
-            .masking(EntryMasking::PlaceHolder)
-            .build()?;
+        let mut r = self.reader().await?;
 
         let c = self.db_pool();
 
-        let s = r.read_entries();
-        let mut s = Box::pin(s);
+        let mut i = 0;
 
-        while let Some(e) = s.try_next().await? {
+        while let Some(res) = r.next().await {
+            let e = res.unwrap();
             let _ = record_entry(c.clone(), e).await?;
+            i.add_assign(1);
         }
 
         self.context.db_recorded = true;
@@ -165,43 +165,88 @@ impl LogData {
     }
 
     pub async fn record_parquet(&mut self) -> Result<(), Error> {
-        let mut buffer = File::create(self.dirs.parquet_dir().unwrap())
+        let r = self.reader().await?.map(|res: Result<Entry, CodecError>| match res {
+                    Ok(e) => {
+                            let e = QueryEntry::from(e);
+
+                                Ok(Chunk::new(e.arrow2_arrays()))
+                            }
+                    Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
+        });
+
+        /*
+        r.for_each(|res| async move {
+            let e = res.unwrap();
+
+            let encoding_map = |data_type: &DataType| {
+                match data_type.to_physical_type() {
+                    // remaining is plain
+                    _ => Encoding::Plain,
+                }
+            };
+
+            // derive the parquet schema (physical types) from arrow's schema.
+            let parquet_schema = to_parquet_schema(&schema)?;
+
+            let row_groups = e.iter().map(|chunk| {
+                // write batch to pages; parallelized by rayon
+                let columns = chunk
+                    .columns()
+                    .par_iter()
+                    .zip(parquet_schema.fields().to_vec())
+                    .zip(QueryEntry::encodings().par_iter())
+                    .flat_map(move |((array, type_), encoding)| {
+                        let encoded_columns = array_to_columns(array, type_, write_options(), encoding)
+                            .unwrap();
+                        encoded_columns
+                            .into_iter()
+                            .map(|encoded_pages| {
+                                let encoded_pages = DynIter::new(
+                                    encoded_pages
+                                        .into_iter()
+                                        .map(|x| x.map_err(|e| ParquetError::General(e.to_string()))),
+                                );
+                                encoded_pages
+                                    .map(|page| {
+                                        compress(page?, vec![], options.compression).map_err(|x| x.into())
+                                    })
+                                    .collect::<Result<VecDeque<_>>>()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Result<Vec<VecDeque<CompressedPage>>>>()?;
+
+                let row_group = DynIter::new(
+                    columns
+                        .into_iter()
+                        .map(|column| Ok(DynStreamingIterator::new(Bla::new(column)))),
+                );
+                Ok(row_group)
+        }).await;
+         */
+
+        let mut file = File::create(self.dirs.parquet_dir().unwrap())
             .await
             .unwrap();
 
-        let mut sink = FileSink::try_new(
-            buffer.compat_mut(),
-            QueryEntry::arrow2_schema(),
-            QueryEntry::encodings(),
-            write_options(),
-        )
-        .unwrap()
-        .buffer(1000);
+        r.chunks(500).for_each_concurrent(100, |mut e| async {
+            let mut buffer = file.try_clone().await.unwrap();
+            let mut sink = FileSink::try_new(
+                buffer.compat_mut(),
+                QueryEntry::arrow2_schema(),
+                QueryEntry::encodings(),
+                write_options(),
+            )
+                .unwrap();
 
-        let br = self.reader().await.unwrap();
+            for i in e.into_iter() {
+                sink.feed(i.unwrap()).await.unwrap();
+            }
 
-        let mut r = Reader::builder()
-            .reader(br)
-            .masking(EntryMasking::PlaceHolder)
-            .build()
-            .unwrap();
+            sink.close().await.unwrap();
+            drop(sink);
+        }).await;
 
-        let s = r
-            .read_entries()
-            .map(|res: Result<Entry, ReadError>| match res {
-                Ok(e) => {
-                    let e = QueryEntry::from(e);
-
-                    Ok(Chunk::new(e.arrow2_arrays()))
-                }
-                Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
-            });
-
-        let mut s = Box::pin(s);
-        sink.borrow_mut().buffer(10).send_all(&mut s).await.unwrap();
-
-        sink.close().await.unwrap();
-        drop(sink);
 
         Ok(())
     }
@@ -210,8 +255,9 @@ impl LogData {
         self.pool.borrow()
     }
 
-    pub async fn reader(&self) -> Result<BufReader<impl AsyncRead>, Error> {
-        Ok(BufReader::new(File::open(&self.path).await?))
+    pub async fn reader(&self) -> Result<FramedRead<File, EntryCodec>, Error> {
+        let f = File::open(&self.path).await?;
+        Ok(FramedRead::with_capacity(f, EntryCodec::default(),3524578 ))
     }
 }
 

@@ -1,28 +1,27 @@
+use alloc::borrow::Cow;
 use mysql_slowlog_parser::EntryStatement::{AdminCommand, SqlStatement};
 use mysql_slowlog_parser::{Entry, EntrySqlStatementObject, EntryStatement};
 use polars::datatypes::ArrowDataType::{Float64, Int32, List, UInt32};
-use polars::export::arrow::array::{
-    Array, Float64Array, ListArray, MutableListArray, MutableUtf8Array, NullArray, PrimitiveArray,
-    TryPush, UInt32Array, Utf8Array,
-};
+use polars::export::arrow::array::{Array, Float64Array, Int64Array, ListArray, MutableListArray, MutableUtf8Array, NullArray, PrimitiveArray, TryPush, UInt32Array, Utf8Array};
+use polars::export::arrow::compute::cast::cast;
 use polars::export::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use polars::export::arrow::io::parquet::write::Encoding;
 use polars::export::arrow::io::parquet::write::Encoding::Plain;
-use polars::prelude::ArrowDataType::{Timestamp, Utf8};
-use polars::prelude::ArrowField;
+use polars::prelude::ArrowDataType::{Duration, Timestamp, Utf8};
+use polars::prelude::{ArrowField, ArrowTimeUnit, DurationChunked};
 use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug)]
-pub struct QueryEntry {
-    pub attributes: QueryAttributes,
+pub struct QueryEntry<'a> {
+    pub attributes: QueryAttributes<'a>,
     pub call: QueryCall,
-    pub session: QuerySession,
+    pub session: QuerySession<'a>,
     pub stats: Stats,
-    pub context: Option<QueryContext>,
+    pub context: Option<QueryContext<'a>>,
 }
 
-impl QueryEntry {
+impl <'a>QueryEntry<'a> {
     pub fn arrow2_schema() -> Schema {
         let mut fields = vec![];
 
@@ -70,7 +69,7 @@ impl QueryEntry {
     }
 }
 
-impl From<Entry> for QueryEntry {
+impl <'a>From<Entry> for QueryEntry<'a> {
     fn from(e: Entry) -> Self {
         let (sql, sql_type, objects, context) = match e.statement() {
             SqlStatement(s) => (
@@ -84,9 +83,9 @@ impl From<Entry> for QueryEntry {
         };
 
         let attributes = QueryAttributes {
-            sql,
-            sql_type,
-            objects,
+            sql: sql.into(),
+            sql_type: sql_type.and_then(|s| Some(Cow::from(s))),
+            objects: objects.into(),
         };
 
         let call = QueryCall {
@@ -95,10 +94,10 @@ impl From<Entry> for QueryEntry {
         };
 
         let session = QuerySession {
-            user_name: e.user().to_string(),
-            sys_user_name: e.sys_user().to_string(),
-            host_name: e.host().to_string(),
-            ip_address: e.ip_address().to_string(),
+            user_name: Cow::from(e.user().to_string()),
+            sys_user_name: Cow::from(e.sys_user().to_string()),
+            host_name: e.host().and_then(|h| Some(Cow::from(h))),
+            ip_address: e.ip_address().and_then(|i| Some(Cow::from(i))),
             thread_id: e.thread_id(),
         };
 
@@ -111,9 +110,9 @@ impl From<Entry> for QueryEntry {
 
         let context = context.and_then(|c| {
             Some(QueryContext {
-                request_id: c.id,
-                caller: c.caller,
-                function: c.function,
+                request_id: c.id.and_then(|s| Some(Cow::from(s))),
+                caller: c.caller.and_then(|s| Some(Cow::from(s))),
+                function: c.function.and_then(|s| Some(Cow::from(s))),
                 line: c.line,
             })
         });
@@ -139,7 +138,7 @@ trait ArrowFields {
         Utf8Array::<i32>::from(&[Some(s)]).boxed()
     }
 
-    fn utf8_list_array(data: Vec<String>) -> Box<ListArray<i32>> {
+    fn utf8_list_array(data: Vec<Cow<'_, str>>) -> Box<ListArray<i32>> {
         let mut list = MutableListArray::<i32, MutableUtf8Array<i32>>::new();
 
         list.try_push(Some(data.iter().map(|d| Some(d)).into_iter()))
@@ -150,14 +149,14 @@ trait ArrowFields {
 }
 
 #[derive(Clone, Debug)]
-pub struct QueryAttributes {
-    pub(crate) sql: String,
-    pub(crate) sql_type: Option<String>,
+pub struct QueryAttributes<'a> {
+    pub(crate) sql: Cow<'a, str>,
+    pub(crate) sql_type: Option<Cow<'a, str>>,
     pub(crate) objects: Option<Vec<EntrySqlStatementObject>>,
 }
 
-impl QueryAttributes {
-    fn object_names(&self) -> Vec<String> {
+impl <'a>QueryAttributes<'a> {
+    fn object_names(&self) -> Vec<Cow<'a, str>> {
         match &self.objects {
             Some(o) => o.iter().fold(vec![], |mut acc, o| {
                 let mut name = String::new();
@@ -168,7 +167,7 @@ impl QueryAttributes {
 
                 name.push_str(&o.object_name);
 
-                acc.push(name);
+                acc.push(Cow::from(name));
 
                 acc
             }),
@@ -177,7 +176,7 @@ impl QueryAttributes {
     }
 }
 
-impl ArrowFields for QueryAttributes {
+impl <'a>ArrowFields for QueryAttributes<'a> {
     fn arrow2_fields() -> Vec<ArrowField> {
         vec![
             ArrowField::new("sql", Utf8, false),
@@ -221,8 +220,8 @@ pub struct QueryCall {
 impl ArrowFields for QueryCall {
     fn arrow2_fields() -> Vec<ArrowField> {
         vec![
-            Field::new("start_time", Timestamp(TimeUnit::Millisecond, None), false),
-            Field::new("log_time", Timestamp(TimeUnit::Millisecond, None), false),
+            Field::new("start_time", Timestamp(TimeUnit::Second, None), false),
+            Field::new("log_time", Timestamp(TimeUnit::Second, None), false),
         ]
     }
 
@@ -241,15 +240,15 @@ impl ArrowFields for QueryCall {
 }
 
 #[derive(Clone, Debug)]
-pub struct QuerySession {
-    pub(crate) user_name: String,
-    pub(crate) sys_user_name: String,
-    pub(crate) host_name: String,
-    pub(crate) ip_address: String,
+pub struct QuerySession<'a> {
+    pub(crate) user_name: Cow<'a, str>,
+    pub(crate) sys_user_name: Cow<'a, str>,
+    pub(crate) host_name: Option<Cow<'a, str>>,
+    pub(crate) ip_address: Option<Cow<'a, str>>,
     pub(crate) thread_id: u32,
 }
 
-impl ArrowFields for QuerySession {
+impl <'a>ArrowFields for QuerySession<'a> {
     fn arrow2_fields() -> Vec<ArrowField> {
         vec![
             ArrowField::new("user_name", Utf8, false),
@@ -275,8 +274,8 @@ impl ArrowFields for QuerySession {
 
         acc.push(Self::utf8_array(&self.user_name));
         acc.push(Self::utf8_array(&self.sys_user_name));
-        acc.push(Self::utf8_array(&self.host_name));
-        acc.push(Self::utf8_array(&self.ip_address));
+        acc.push(Self::utf8_array(&self.host_name.clone().unwrap_or(Cow::from("localhost"))));
+        acc.push(Self::utf8_array(&self.ip_address.clone().unwrap_or(Cow::from("127.0.0.1"))));
         acc.push(UInt32Array::from(&[Some(self.thread_id)]).boxed());
 
         acc
@@ -294,8 +293,8 @@ pub struct Stats {
 impl ArrowFields for Stats {
     fn arrow2_fields() -> Vec<ArrowField> {
         vec![
-            ArrowField::new("query_time", Float64, false),
-            ArrowField::new("lock_time", Float64, false),
+            ArrowField::new("query_time", Duration(TimeUnit::Microsecond), false),
+            ArrowField::new("lock_time", Duration(TimeUnit::Microsecond), false),
             ArrowField::new("rows_sent", Int32, true),
             ArrowField::new("rows_examined", Int32, true),
         ]
@@ -308,8 +307,8 @@ impl ArrowFields for Stats {
     fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
         let mut acc = vec![];
 
-        acc.push(Float64Array::from(&[Some(self.query_time)]).boxed());
-        acc.push(Float64Array::from(&[Some(self.lock_time)]).boxed());
+        acc.push(Int64Array::from(&[Some((self.query_time*1000000.0) as i64)]).boxed());
+        acc.push(Int64Array::from(&[Some((self.lock_time*1000000.0) as i64)]).boxed());
         acc.push(UInt32Array::from(&[Some(self.rows_sent)]).boxed());
         acc.push(UInt32Array::from(&[Some(self.rows_examined)]).boxed());
 
@@ -318,14 +317,14 @@ impl ArrowFields for Stats {
 }
 
 #[derive(Clone, Debug)]
-pub struct QueryContext {
-    pub request_id: Option<String>,
-    pub caller: Option<String>,
-    pub function: Option<String>,
+pub struct QueryContext<'a> {
+    pub request_id: Option<Cow<'a, str>>,
+    pub caller: Option<Cow<'a, str>>,
+    pub function: Option<Cow<'a, str>>,
     pub line: Option<u32>,
 }
 
-impl ArrowFields for QueryContext {
+impl <'a>ArrowFields for QueryContext<'a> {
     fn arrow2_fields() -> Vec<ArrowField> {
         vec![
             Field::new("request_id", Utf8, true),

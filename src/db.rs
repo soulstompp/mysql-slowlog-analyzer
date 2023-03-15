@@ -117,7 +117,7 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<
 
 async fn find_query(
     tx: &mut Transaction<'_, Sqlite>,
-    params: &QueryAttributes,
+    params: &QueryAttributes<'_>,
 ) -> Result<u32, Error> {
     let r = sqlx::query("SELECT id FROM db_ojects WHERE schema = ?")
         .bind(params.sql.to_string())
@@ -153,7 +153,7 @@ async fn find_db_object(
 
 async fn insert_query(
     tx: &mut Transaction<'_, Sqlite>,
-    params: QueryAttributes,
+    params: QueryAttributes<'_>,
 ) -> Result<u32, Error> {
     if let Ok(id) = find_query(tx, &params).await {
         return Ok(id);
@@ -178,7 +178,7 @@ async fn insert_query(
 async fn insert_query_objects(
     tx: &mut Transaction<'_, Sqlite>,
     query_id: u32,
-    params: QueryAttributes,
+    params: QueryAttributes<'_>,
 ) -> Result<(), Error> {
     if let Some(l) = params.objects {
         for o in l {
@@ -245,14 +245,14 @@ async fn insert_query_call(
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
-struct InsertQuerySessionParams {
+struct InsertQuerySessionParams<'a> {
     query_call_id: u32,
-    session: QuerySession,
+    session: QuerySession<'a>,
 }
 
 async fn insert_query_session(
     tx: &mut Transaction<'_, Sqlite>,
-    params: InsertQuerySessionParams,
+    params: InsertQuerySessionParams<'_>,
 ) -> Result<(), Error> {
     sqlx::query(
         "INSERT INTO query_call_session (query_call_id, user_name, sys_user_name, host_name,
@@ -294,14 +294,14 @@ async fn insert_query_stats(
     Ok(())
 }
 
-struct InsertQueryContextParams {
+struct InsertQueryContextParams<'a> {
     query_call_id: u32,
-    context: QueryContext,
+    context: QueryContext<'a>,
 }
 
 async fn insert_query_context(
     tx: &mut Transaction<'_, Sqlite>,
-    params: InsertQueryContextParams,
+    params: InsertQueryContextParams<'_>,
 ) -> Result<(), Error> {
     let _ = sqlx::query(
         "INSERT INTO query_call_context (query_call_id, request_id, caller, function, line)
