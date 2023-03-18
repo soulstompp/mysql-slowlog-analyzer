@@ -1,9 +1,13 @@
-use crate::types::{QueryAttributes, QueryCall, QueryContext, QueryEntry, QuerySession, Stats};
+use crate::types::{
+    QueryCall, QueryContext, QueryEntry, QuerySession, QuerySqlAttributes,
+    QuerySqlStatementObjects, QueryStats,
+};
 use crate::Error;
+use alloc::borrow::Cow;
 use core::borrow::BorrowMut;
 use core::fmt::{Display, Formatter};
 use core::str::FromStr;
-use mysql_slowlog_parser::{Entry, EntrySqlStatementObject};
+use mysql_slowlog_parser::SqlStatementContext;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::ops::AddAssign;
@@ -54,7 +58,7 @@ pub fn db_url(p: Option<&Path>) -> String {
     }
 }
 
-pub async fn record_entry(c: SqlitePool, e: Entry) -> Result<u32, Error> {
+pub async fn record_entry(c: SqlitePool, e: QueryEntry) -> Result<u32, Error> {
     let mut tx = c.begin().await?;
 
     let query_call_id = insert_entry(&mut tx, e).await?;
@@ -64,63 +68,67 @@ pub async fn record_entry(c: SqlitePool, e: Entry) -> Result<u32, Error> {
     Ok(query_call_id)
 }
 
-pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: Entry) -> Result<u32, Error> {
-    let e = QueryEntry::from(e);
-
-    let query_id = insert_query(tx, e.attributes.clone()).await?;
+pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: QueryEntry) -> Result<u32, Error> {
+    let query_id = insert_query(tx, e.sql_attributes()).await?;
 
     let query_call_id = insert_query_call(
         tx,
         InsertQueryCallParams {
             query_id,
-            query_call: e.call.clone(),
+            query_call: e.call(),
         },
     )
     .await?;
+
+    println!("inserted query call");
 
     let _ = insert_query_session(
         tx,
         InsertQuerySessionParams {
             query_call_id,
-            session: e.session.clone(),
+            session: e.session(),
         },
     )
     .await?;
+
+    println!("inserted a query call id");
 
     let _ = insert_query_stats(
         tx,
         InsertQueryStatsParams {
             query_call_id,
-            stats: e.stats.clone(),
+            stats: e.stats(),
         },
     )
     .await?;
 
-    if let Some(c) = e.context {
+    if let Some(c) = e.sql_attributes().statement.sql_context() {
         let _ = insert_query_context(
             tx,
             InsertQueryContextParams {
                 query_call_id,
-                context: QueryContext {
-                    request_id: c.request_id,
-                    caller: c.caller,
-                    function: c.function,
-                    line: c.line,
-                },
+                context: QueryContext(SqlStatementContext {
+                    request_id: c.request_id.clone(),
+                    caller: c.caller.clone(),
+                    function: c.function.clone(),
+                    line: c.line.clone(),
+                }),
             },
         )
         .await?;
     }
+
+    println!("got query context");
 
     Ok(query_call_id)
 }
 
 async fn find_query(
     tx: &mut Transaction<'_, Sqlite>,
-    params: &QueryAttributes<'_>,
+    params: &QuerySqlAttributes,
 ) -> Result<u32, Error> {
     let r = sqlx::query("SELECT id FROM db_ojects WHERE schema = ?")
-        .bind(params.sql.to_string())
+        .bind(params.sql())
         .fetch_one(tx)
         .await?;
 
@@ -131,8 +139,8 @@ async fn find_query(
 
 async fn find_db_object(
     tx: &mut Transaction<'_, Sqlite>,
-    schema: Option<String>,
-    object_name: String,
+    schema: Option<Cow<'_, str>>,
+    object_name: Cow<'_, str>,
 ) -> Result<u32, Error> {
     let r = sqlx::query(
         format!(
@@ -153,15 +161,15 @@ async fn find_db_object(
 
 async fn insert_query(
     tx: &mut Transaction<'_, Sqlite>,
-    params: QueryAttributes<'_>,
+    params: QuerySqlAttributes,
 ) -> Result<u32, Error> {
     if let Ok(id) = find_query(tx, &params).await {
         return Ok(id);
     }
 
     let result = sqlx::query("INSERT INTO queries (sql, sql_type) VALUES (?, ?)")
-        .bind(&params.sql)
-        .bind(&params.sql_type)
+        .bind(&params.sql())
+        .bind(&params.sql_type().and_then(|t| Some(t.to_string())))
         .execute(tx.borrow_mut())
         .await
         .unwrap();
@@ -178,11 +186,11 @@ async fn insert_query(
 async fn insert_query_objects(
     tx: &mut Transaction<'_, Sqlite>,
     query_id: u32,
-    params: QueryAttributes<'_>,
+    params: QuerySqlAttributes,
 ) -> Result<(), Error> {
-    if let Some(l) = params.objects {
+    if let Some(l) = params.objects() {
         for o in l {
-            let db_object_id = insert_db_objects(tx, o).await?;
+            let db_object_id = insert_db_objects(tx, QuerySqlStatementObjects(o)).await?;
 
             let _ = sqlx::query(
                 "INSERT INTO query_objects (query_id, db_object_id) VALUES \
@@ -201,16 +209,15 @@ async fn insert_query_objects(
 
 async fn insert_db_objects(
     tx: &mut Transaction<'_, Sqlite>,
-    object: EntrySqlStatementObject,
+    object: QuerySqlStatementObjects,
 ) -> Result<u32, Error> {
-    if let Ok(id) = find_db_object(tx, object.schema_name.clone(), object.object_name.clone()).await
-    {
+    if let Ok(id) = find_db_object(tx, object.schema_name(), object.object_name()).await {
         return Ok(id);
     }
 
     let result = sqlx::query("INSERT INTO db_objects (schema_name, object_name) VALUES (?, ?)")
-        .bind(object.schema_name.clone())
-        .bind(object.object_name.clone())
+        .bind(object.schema_name())
+        .bind(object.object_name())
         .execute(tx)
         .await
         .unwrap();
@@ -235,8 +242,8 @@ async fn insert_query_call(
             ",
     )
     .bind(params.query_id)
-    .bind(&params.query_call.start_time)
-    .bind(&params.query_call.log_time)
+    .bind(&params.query_call.start_time())
+    .bind(&params.query_call.log_time())
     .execute(tx)
     .await?;
 
@@ -245,14 +252,14 @@ async fn insert_query_call(
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
-struct InsertQuerySessionParams<'a> {
+struct InsertQuerySessionParams {
     query_call_id: u32,
-    session: QuerySession<'a>,
+    session: QuerySession,
 }
 
 async fn insert_query_session(
     tx: &mut Transaction<'_, Sqlite>,
-    params: InsertQuerySessionParams<'_>,
+    params: InsertQuerySessionParams,
 ) -> Result<(), Error> {
     sqlx::query(
         "INSERT INTO query_call_session (query_call_id, user_name, sys_user_name, host_name,
@@ -260,11 +267,11 @@ async fn insert_query_session(
         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(params.query_call_id)
-    .bind(params.session.user_name)
-    .bind(params.session.sys_user_name)
-    .bind(params.session.host_name)
-    .bind(params.session.ip_address)
-    .bind(params.session.thread_id)
+    .bind(params.session.user_name())
+    .bind(params.session.sys_user_name())
+    .bind(params.session.host_name())
+    .bind(params.session.ip_address())
+    .bind(params.session.thread_id())
     .execute(tx)
     .await?;
 
@@ -273,7 +280,7 @@ async fn insert_query_session(
 
 struct InsertQueryStatsParams {
     query_call_id: u32,
-    stats: Stats,
+    stats: QueryStats,
 }
 
 async fn insert_query_stats(
@@ -284,33 +291,33 @@ async fn insert_query_stats(
         "INSERT INTO query_call_stats (query_call_id, query_time, lock_time, rows_sent, rows_examined)
         VALUES (?, ?, ?, ?, ?)")
         .bind(&params.query_call_id)
-        .bind(&params.stats.query_time)
-        .bind(&params.stats.lock_time)
-        .bind(&params.stats.rows_sent)
-        .bind(&params.stats.rows_examined)
+        .bind(&params.stats.query_time())
+        .bind(&params.stats.lock_time())
+        .bind(&params.stats.rows_sent())
+        .bind(&params.stats.rows_examined())
         .execute(tx)
         .await?;
 
     Ok(())
 }
 
-struct InsertQueryContextParams<'a> {
+struct InsertQueryContextParams {
     query_call_id: u32,
-    context: QueryContext<'a>,
+    context: QueryContext,
 }
 
 async fn insert_query_context(
     tx: &mut Transaction<'_, Sqlite>,
-    params: InsertQueryContextParams<'_>,
+    params: InsertQueryContextParams,
 ) -> Result<(), Error> {
     let _ = sqlx::query(
         "INSERT INTO query_call_context (query_call_id, request_id, caller, function, line)
         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&params.query_call_id)
-    .bind(&params.context.caller)
-    .bind(&params.context.function)
-    .bind(&params.context.line)
+    .bind(&params.context.caller())
+    .bind(&params.context.function())
+    .bind(&params.context.line())
     .execute(tx)
     .await?;
 
@@ -502,7 +509,7 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 /// use sqlx::sqlite::SqliteRow;
 /// use sqlx::Row;
 /// use sqlx::FromRow;
-/// use mysql_slowlog_analyzer::types::Stats;
+/// use mysql_slowlog_analyzer::types::QueryStats;
 ///
 ///#[derive(Debug)]
 ///struct StatsBySql {

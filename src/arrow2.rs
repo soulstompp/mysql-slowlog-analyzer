@@ -1,10 +1,12 @@
-use polars::export::arrow::io::parquet::write::{CompressionOptions, Version, WriteOptions};
+use polars::export::arrow::io::parquet::write::{
+    CompressionOptions, GzipLevel, Version, WriteOptions,
+};
 
 pub fn write_options() -> WriteOptions {
     WriteOptions {
         write_statistics: true,
         version: Version::V2,
-        compression: CompressionOptions::Snappy,
+        compression: CompressionOptions::Gzip(Some(GzipLevel::default())),
         data_pagesize_limit: None,
     }
 }

@@ -8,32 +8,29 @@ pub mod db;
 mod dirs;
 pub mod types;
 
-use core::borrow::{Borrow, BorrowMut};
-use std::collections::VecDeque;
+use core::borrow::Borrow;
+use std::collections::HashMap;
 use std::io;
 use std::ops::AddAssign;
 
-use async_compat::CompatExt;
+use async_compat::{Compat, CompatExt};
 use tokio::fs::File;
 
 use ::polars::error::{ArrowError, PolarsError};
 
 use ::polars::export::arrow::chunk::Chunk;
-use futures::{FutureExt, pin_mut, SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt};
 
 #[doc(inline)]
 pub use crate::db::{
     open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
     RelationalObject, SortingPlan,
 };
-use mysql_slowlog_parser::{CodecError, Entry, EntryCodec, EntryMasking, ReadError};
+use mysql_slowlog_parser::{CodecError, Entry, EntryCodec, EntrySqlType, ReadError};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateDatabase, MigrateError};
 use sqlx::{Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
-use polars::export::arrow::datatypes::DataType;
-use polars::export::arrow::io::parquet::read::ParquetError;
-use tokio::io::{AsyncRead, BufReader};
 
 use thiserror::Error;
 use tokio::fs::create_dir_all;
@@ -44,11 +41,9 @@ use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
 
 use crate::types::QueryEntry;
-use polars::export::arrow::io::parquet::write::{array_to_columns, compress, CompressedPage, DynIter, DynStreamingIterator, Encoding, FileSink, to_parquet_schema, transverse};
-use polars::export::rayon::prelude::IntoParallelRefIterator;
+use polars::export::arrow::io::parquet::write::FileSink;
+use time::Instant;
 use tokio_util::codec::FramedRead;
-#[doc(inline)]
-pub use types::Stats;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -155,7 +150,7 @@ impl LogData {
 
         while let Some(res) = r.next().await {
             let e = res.unwrap();
-            let _ = record_entry(c.clone(), e).await?;
+            let _ = record_entry(c.clone(), QueryEntry(e)).await?;
             i.add_assign(1);
         }
 
@@ -165,88 +160,112 @@ impl LogData {
     }
 
     pub async fn record_parquet(&mut self) -> Result<(), Error> {
-        let r = self.reader().await?.map(|res: Result<Entry, CodecError>| match res {
-                    Ok(e) => {
-                            let e = QueryEntry::from(e);
+        //TODO if the directory already exists just return OK(()), waiting until testing is done
+        // to add.
 
-                                Ok(Chunk::new(e.arrow2_arrays()))
-                            }
-                    Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
-        });
-
-        /*
-        r.for_each(|res| async move {
-            let e = res.unwrap();
-
-            let encoding_map = |data_type: &DataType| {
-                match data_type.to_physical_type() {
-                    // remaining is plain
-                    _ => Encoding::Plain,
+        println!("recording");
+        create_dir_all(self.parquet_dir().unwrap()).await?;
+        let r = self
+            .reader()
+            .await?
+            .map(|res: Result<Entry, CodecError>| match res {
+                Ok(e) => {
+                    let qe = QueryEntry(e);
+                    Ok((
+                        qe.0.sql_attributes.sql_type().clone(),
+                        Chunk::new(qe.arrow2_arrays()),
+                    ))
                 }
-            };
+                Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
+            });
 
-            // derive the parquet schema (physical types) from arrow's schema.
-            let parquet_schema = to_parquet_schema(&schema)?;
+        let mut files: HashMap<&str, File> = HashMap::new();
 
-            let row_groups = e.iter().map(|chunk| {
-                // write batch to pages; parallelized by rayon
-                let columns = chunk
-                    .columns()
-                    .par_iter()
-                    .zip(parquet_schema.fields().to_vec())
-                    .zip(QueryEntry::encodings().par_iter())
-                    .flat_map(move |((array, type_), encoding)| {
-                        let encoded_columns = array_to_columns(array, type_, write_options(), encoding)
-                            .unwrap();
-                        encoded_columns
-                            .into_iter()
-                            .map(|encoded_pages| {
-                                let encoded_pages = DynIter::new(
-                                    encoded_pages
-                                        .into_iter()
-                                        .map(|x| x.map_err(|e| ParquetError::General(e.to_string()))),
-                                );
-                                encoded_pages
-                                    .map(|page| {
-                                        compress(page?, vec![], options.compression).map_err(|x| x.into())
-                                    })
-                                    .collect::<Result<VecDeque<_>>>()
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Result<Vec<VecDeque<CompressedPage>>>>()?;
+        for part in [
+            "contextual",
+            "create",
+            "delete",
+            "read",
+            "transactional",
+            "update",
+        ] {
+            let mut p = self.dirs.parquet_dir().unwrap();
+            p.push(part);
 
-                let row_group = DynIter::new(
-                    columns
-                        .into_iter()
-                        .map(|column| Ok(DynStreamingIterator::new(Bla::new(column)))),
+            let f = File::create(&p).await.unwrap();
+
+            files.insert(part, f);
+        }
+
+        let capacity = 50;
+
+        r.ready_chunks(capacity)
+            .for_each_concurrent(4, |ready| async {
+                let ready_count = ready.len();
+
+                let write_began = Instant::now();
+                let mut sinks: HashMap<&str, FileSink<Compat<File>>> = HashMap::new();
+
+                for e in ready.into_iter() {
+                    let (sql_type, log_entry) = e.unwrap();
+                    /*
+                                   "SELECT" => "create",
+                                   "INSERT" => "read",
+                                   "UPDATE" => "update",
+                                   "DELETE" => "delete",
+                                   "COMMIT TRANSACTION" => "transactional",
+                                   "ROLLBACK TRANSACTION" => "transactional",
+                                   "SAVEPOINT" => "transactional",
+
+                    */
+                    let part = match sql_type {
+                        Some(t) => match t {
+                            EntrySqlType::Query => "read",
+                            EntrySqlType::Insert => "create",
+                            EntrySqlType::Update => "update",
+                            EntrySqlType::Delete => "delete",
+                            EntrySqlType::StartTransaction => "transactional",
+                            EntrySqlType::SetTransaction => "transactional",
+                            EntrySqlType::Commit => "transactional",
+                            EntrySqlType::Rollback => "transactional",
+                            EntrySqlType::Savepoint => "transactional",
+                            _ => "contextual",
+                        },
+                        _ => "contextual",
+                    };
+
+                    let file = files.get(part).unwrap();
+
+                    let buffer = file.try_clone().await.unwrap().compat();
+
+                    let sink = sinks.entry(part).or_insert(
+                        FileSink::try_new(
+                            buffer,
+                            QueryEntry::arrow2_schema(),
+                            QueryEntry::encodings(),
+                            write_options(),
+                        )
+                        .unwrap(),
+                    );
+
+                    sink.feed(log_entry).await.unwrap();
+                }
+
+                println!(
+                    "feeding of the {} in {} seconds",
+                    ready_count,
+                    write_began.elapsed()
                 );
-                Ok(row_group)
-        }).await;
-         */
 
-        let mut file = File::create(self.dirs.parquet_dir().unwrap())
-            .await
-            .unwrap();
+                for sink in sinks.values_mut() {
+                    sink.close().await.unwrap();
+                }
 
-        r.chunks(500).for_each_concurrent(100, |mut e| async {
-            let mut buffer = file.try_clone().await.unwrap();
-            let mut sink = FileSink::try_new(
-                buffer.compat_mut(),
-                QueryEntry::arrow2_schema(),
-                QueryEntry::encodings(),
-                write_options(),
-            )
-                .unwrap();
+                println!("sinks closed in {} seconds", write_began.elapsed());
 
-            for i in e.into_iter() {
-                sink.feed(i.unwrap()).await.unwrap();
-            }
-
-            sink.close().await.unwrap();
-            drop(sink);
-        }).await;
-
+                drop(sinks);
+            })
+            .await;
 
         Ok(())
     }
@@ -257,7 +276,7 @@ impl LogData {
 
     pub async fn reader(&self) -> Result<FramedRead<File, EntryCodec>, Error> {
         let f = File::open(&self.path).await?;
-        Ok(FramedRead::with_capacity(f, EntryCodec::default(),3524578 ))
+        Ok(FramedRead::with_capacity(f, EntryCodec::default(), 14229))
     }
 }
 
