@@ -7,7 +7,7 @@ pub fn write_options() -> WriteOptions {
         write_statistics: true,
         version: Version::V2,
         compression: CompressionOptions::Gzip(Some(GzipLevel::default())),
-        data_pagesize_limit: None,
+        data_pagesize_limit: Some(5000),
     }
 }
 

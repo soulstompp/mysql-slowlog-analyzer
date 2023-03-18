@@ -9,7 +9,11 @@ mod dirs;
 pub mod types;
 
 use core::borrow::Borrow;
+use core::fmt::{Display, Formatter, write};
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry::Occupied;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io;
 use std::ops::AddAssign;
 
@@ -31,6 +35,7 @@ use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateDatabase, MigrateError};
 use sqlx::{Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
+use polars::export::arrow::array::Array;
 
 use thiserror::Error;
 use tokio::fs::create_dir_all;
@@ -163,109 +168,43 @@ impl LogData {
         //TODO if the directory already exists just return OK(()), waiting until testing is done
         // to add.
 
+        let mut write_began = Instant::now();
+
         println!("recording");
-        create_dir_all(self.parquet_dir().unwrap()).await?;
-        let r = self
+        let data_dir = self.parquet_dir().unwrap();
+        create_dir_all(&data_dir).await?;
+        let mut r = self
             .reader()
             .await?
             .map(|res: Result<Entry, CodecError>| match res {
                 Ok(e) => {
                     let qe = QueryEntry(e);
                     Ok((
-                        qe.0.sql_attributes.sql_type().clone(),
+                        qe.0.sql_attributes.sql_type(),
                         Chunk::new(qe.arrow2_arrays()),
                     ))
                 }
                 Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
             });
 
-        let mut files: HashMap<&str, File> = HashMap::new();
+        let mut sinks = ParquetSinks::open(&data_dir).await;
 
-        for part in [
-            "contextual",
-            "create",
-            "delete",
-            "read",
-            "transactional",
-            "update",
-        ] {
-            let mut p = self.dirs.parquet_dir().unwrap();
-            p.push(part);
-
-            let f = File::create(&p).await.unwrap();
-
-            files.insert(part, f);
-        }
 
         let capacity = 50;
 
-        r.ready_chunks(capacity)
-            .for_each_concurrent(4, |ready| async {
-                let ready_count = ready.len();
 
-                let write_began = Instant::now();
-                let mut sinks: HashMap<&str, FileSink<Compat<File>>> = HashMap::new();
+        while let (sql_type, log_entry) = r.next().await.unwrap().unwrap() {
+            sinks.feed(sql_type, log_entry).await.unwrap();
 
-                for e in ready.into_iter() {
-                    let (sql_type, log_entry) = e.unwrap();
-                    /*
-                                   "SELECT" => "create",
-                                   "INSERT" => "read",
-                                   "UPDATE" => "update",
-                                   "DELETE" => "delete",
-                                   "COMMIT TRANSACTION" => "transactional",
-                                   "ROLLBACK TRANSACTION" => "transactional",
-                                   "SAVEPOINT" => "transactional",
+        }
 
-                    */
-                    let part = match sql_type {
-                        Some(t) => match t {
-                            EntrySqlType::Query => "read",
-                            EntrySqlType::Insert => "create",
-                            EntrySqlType::Update => "update",
-                            EntrySqlType::Delete => "delete",
-                            EntrySqlType::StartTransaction => "transactional",
-                            EntrySqlType::SetTransaction => "transactional",
-                            EntrySqlType::Commit => "transactional",
-                            EntrySqlType::Rollback => "transactional",
-                            EntrySqlType::Savepoint => "transactional",
-                            _ => "contextual",
-                        },
-                        _ => "contextual",
-                    };
+        println!("written in {} seconds", write_began.elapsed());
 
-                    let file = files.get(part).unwrap();
+        write_began = Instant::now();
 
-                    let buffer = file.try_clone().await.unwrap().compat();
-
-                    let sink = sinks.entry(part).or_insert(
-                        FileSink::try_new(
-                            buffer,
-                            QueryEntry::arrow2_schema(),
-                            QueryEntry::encodings(),
-                            write_options(),
-                        )
-                        .unwrap(),
-                    );
-
-                    sink.feed(log_entry).await.unwrap();
-                }
-
-                println!(
-                    "feeding of the {} in {} seconds",
-                    ready_count,
-                    write_began.elapsed()
-                );
-
-                for sink in sinks.values_mut() {
-                    sink.close().await.unwrap();
-                }
-
-                println!("sinks closed in {} seconds", write_began.elapsed());
-
-                drop(sinks);
-            })
-            .await;
+        sinks.close_all();
+        println!("sinks closed in {} seconds", write_began.elapsed());
+        drop(sinks);
 
         Ok(())
     }
@@ -290,6 +229,123 @@ pub struct LogDataContext {
     config: LogDataConfig,
     db_recorded: bool,
     aliases: Vec<String>,
+}
+
+#[derive(Error, Debug)]
+pub enum FileSinkError {
+    FileSink,
+}
+
+impl Display for FileSinkError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::FileSink=> {
+                write!(f, "File sink error")
+            }
+        }
+    }
+}
+
+pub struct ParquetSinks<'a> {
+    sinks: HashMap<&'a str, RefCell<FileSink<'a, Compat<File>>>>,
+    data_dir: &'a Path,
+    handles: HashMap<&'a str, RefCell<File>>,
+    chunks: HashMap<&'a str, RefCell<usize>>,
+}
+
+impl <'a>ParquetSinks<'a> {
+    pub async fn open(d: &'a Path) -> ParquetSinks<'a> {
+        let names = [
+            "create",
+            "contextual",
+            "delete",
+            "read",
+            "transactional",
+            "unparseable",
+            "update"
+        ];
+
+        let mut sinks = HashMap::new();
+        let mut chunks = HashMap::new();
+        let mut handles = HashMap::new();
+
+        for name in names {
+            let mut p = d.to_path_buf();
+            p.push(name);
+
+            let f = File::create(&p).await.unwrap();
+
+            let s = Self::build_sink(&f).await.unwrap();
+
+            handles.insert(name, RefCell::from(f));
+
+            let _ = sinks.insert(name, RefCell::from(s));
+            let _ = chunks.insert(name, RefCell::from(0usize));
+        }
+
+        Self {
+            sinks: sinks.into(),
+            chunks: chunks.into(),
+            handles: handles.into(),
+            data_dir: d,
+        }
+    }
+
+    async fn build_sink(f: &File) -> Result<FileSink<'a, Compat<File>>, Error>{
+        Ok(FileSink::try_new(
+            f.try_clone().await?.compat(),
+            QueryEntry::arrow2_schema(),
+            QueryEntry::encodings(),
+            write_options(),
+        )?)
+    }
+
+    pub fn partition_name(&self, ot: Option<EntrySqlType>) -> &'a str {
+        if let Some(t) = ot {
+        match t {
+                EntrySqlType::Query => "read",
+                EntrySqlType::Insert => "create",
+                EntrySqlType::Update => "update",
+                EntrySqlType::Delete => "delete",
+                EntrySqlType::StartTransaction => "transactional",
+                EntrySqlType::SetTransaction => "transactional",
+                EntrySqlType::Commit => "transactional",
+                EntrySqlType::Rollback => "transactional",
+                EntrySqlType::Savepoint => "transactional",
+                _ => "contextual",
+        }
+        } else {
+            "unparseable"
+        }
+    }
+
+    pub async fn feed(&self, t: Option<EntrySqlType>, e: Chunk<Box<dyn Array>>) -> Result<(), Error> {
+        let name = self.partition_name(t.clone());
+        let mut sink = self.sinks.get(name).expect(&format!("expected {} sink to exist", name))
+                                                       .clone().borrow_mut();
+        sink.feed(e).await.unwrap();
+
+        let mut count = self.chunks.get(name).unwrap().borrow_mut();
+        count.add_assign(1);
+
+        if *count == 1500 {
+            let _ = sink.close();
+
+            *sink = Self::build_sink(&self.handles.get(name).unwrap().borrow()).await.unwrap();
+            *count = 0;
+        }
+
+        Ok(())
+    }
+
+    pub async fn close_all(&mut self) {
+        for sink in self.sinks.values_mut() {
+            //TODO: throw this error
+            sink.borrow_mut().close().await.unwrap();
+        }
+
+        self.sinks = HashMap::new();
+    }
 }
 
 #[cfg(test)]
