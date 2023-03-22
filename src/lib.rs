@@ -9,45 +9,34 @@ mod dirs;
 pub mod types;
 
 use core::borrow::Borrow;
-use core::fmt::{Display, Formatter, write};
-use std::cell::{Cell, RefCell};
-use std::collections::hash_map::Entry::Occupied;
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::io;
 use std::ops::AddAssign;
 
-use async_compat::{Compat, CompatExt};
 use tokio::fs::File;
 
 use ::polars::error::{ArrowError, PolarsError};
-
-use ::polars::export::arrow::chunk::Chunk;
-use futures::{SinkExt, StreamExt};
 
 #[doc(inline)]
 pub use crate::db::{
     open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
     RelationalObject, SortingPlan,
 };
-use mysql_slowlog_parser::{CodecError, Entry, EntryCodec, EntrySqlType, ReadError};
+use futures::StreamExt;
+use mysql_slowlog_parser::{CodecError, Entry, EntryCodec, ReadError};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateDatabase, MigrateError};
 use sqlx::{Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
-use polars::export::arrow::array::Array;
 
 use thiserror::Error;
 use tokio::fs::create_dir_all;
 
-use crate::arrow2::write_options;
 use crate::db::db_url;
 use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
 
+use self::arrow2::ParquetSinks;
 use crate::types::QueryEntry;
-use polars::export::arrow::io::parquet::write::FileSink;
-use time::Instant;
 use tokio_util::codec::FramedRead;
 
 #[derive(Error, Debug)]
@@ -57,7 +46,7 @@ pub enum Error {
     #[error("{0}")]
     DirError(#[from] DirError),
     #[error("io error: {0}")]
-    IO(#[from] std::io::Error),
+    IO(#[from] io::Error),
     #[error("invalid primary key: {0}")]
     InvalidPrimaryKey(#[from] InvalidPrimaryKey),
     #[error("invalid order by clause: {0}")]
@@ -167,11 +156,12 @@ impl LogData {
     pub async fn record_parquet(&mut self) -> Result<(), Error> {
         //TODO if the directory already exists just return OK(()), waiting until testing is done
         // to add.
-
-        let mut write_began = Instant::now();
-
-        println!("recording");
         let data_dir = self.parquet_dir().unwrap();
+
+        if data_dir.exists() {
+            return Ok(());
+        }
+
         create_dir_all(&data_dir).await?;
         let mut r = self
             .reader()
@@ -179,32 +169,20 @@ impl LogData {
             .map(|res: Result<Entry, CodecError>| match res {
                 Ok(e) => {
                     let qe = QueryEntry(e);
-                    Ok((
-                        qe.0.sql_attributes.sql_type(),
-                        Chunk::new(qe.arrow2_arrays()),
-                    ))
+                    Ok((qe.0.sql_attributes.sql_type(), qe))
                 }
                 Err(e) => Err(ArrowError::External(e.to_string(), Box::new(e))),
             });
 
         let mut sinks = ParquetSinks::open(&data_dir).await;
 
+        while let Some(res) = r.next().await {
+            let (sql_type, log_entry) = res.unwrap();
 
-        let capacity = 50;
-
-
-        while let (sql_type, log_entry) = r.next().await.unwrap().unwrap() {
             sinks.feed(sql_type, log_entry).await.unwrap();
-
         }
 
-        println!("written in {} seconds", write_began.elapsed());
-
-        write_began = Instant::now();
-
-        sinks.close_all();
-        println!("sinks closed in {} seconds", write_began.elapsed());
-        drop(sinks);
+        sinks.close_all().await.unwrap();
 
         Ok(())
     }
@@ -229,123 +207,6 @@ pub struct LogDataContext {
     config: LogDataConfig,
     db_recorded: bool,
     aliases: Vec<String>,
-}
-
-#[derive(Error, Debug)]
-pub enum FileSinkError {
-    FileSink,
-}
-
-impl Display for FileSinkError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::FileSink=> {
-                write!(f, "File sink error")
-            }
-        }
-    }
-}
-
-pub struct ParquetSinks<'a> {
-    sinks: HashMap<&'a str, RefCell<FileSink<'a, Compat<File>>>>,
-    data_dir: &'a Path,
-    handles: HashMap<&'a str, RefCell<File>>,
-    chunks: HashMap<&'a str, RefCell<usize>>,
-}
-
-impl <'a>ParquetSinks<'a> {
-    pub async fn open(d: &'a Path) -> ParquetSinks<'a> {
-        let names = [
-            "create",
-            "contextual",
-            "delete",
-            "read",
-            "transactional",
-            "unparseable",
-            "update"
-        ];
-
-        let mut sinks = HashMap::new();
-        let mut chunks = HashMap::new();
-        let mut handles = HashMap::new();
-
-        for name in names {
-            let mut p = d.to_path_buf();
-            p.push(name);
-
-            let f = File::create(&p).await.unwrap();
-
-            let s = Self::build_sink(&f).await.unwrap();
-
-            handles.insert(name, RefCell::from(f));
-
-            let _ = sinks.insert(name, RefCell::from(s));
-            let _ = chunks.insert(name, RefCell::from(0usize));
-        }
-
-        Self {
-            sinks: sinks.into(),
-            chunks: chunks.into(),
-            handles: handles.into(),
-            data_dir: d,
-        }
-    }
-
-    async fn build_sink(f: &File) -> Result<FileSink<'a, Compat<File>>, Error>{
-        Ok(FileSink::try_new(
-            f.try_clone().await?.compat(),
-            QueryEntry::arrow2_schema(),
-            QueryEntry::encodings(),
-            write_options(),
-        )?)
-    }
-
-    pub fn partition_name(&self, ot: Option<EntrySqlType>) -> &'a str {
-        if let Some(t) = ot {
-        match t {
-                EntrySqlType::Query => "read",
-                EntrySqlType::Insert => "create",
-                EntrySqlType::Update => "update",
-                EntrySqlType::Delete => "delete",
-                EntrySqlType::StartTransaction => "transactional",
-                EntrySqlType::SetTransaction => "transactional",
-                EntrySqlType::Commit => "transactional",
-                EntrySqlType::Rollback => "transactional",
-                EntrySqlType::Savepoint => "transactional",
-                _ => "contextual",
-        }
-        } else {
-            "unparseable"
-        }
-    }
-
-    pub async fn feed(&self, t: Option<EntrySqlType>, e: Chunk<Box<dyn Array>>) -> Result<(), Error> {
-        let name = self.partition_name(t.clone());
-        let mut sink = self.sinks.get(name).expect(&format!("expected {} sink to exist", name))
-                                                       .clone().borrow_mut();
-        sink.feed(e).await.unwrap();
-
-        let mut count = self.chunks.get(name).unwrap().borrow_mut();
-        count.add_assign(1);
-
-        if *count == 1500 {
-            let _ = sink.close();
-
-            *sink = Self::build_sink(&self.handles.get(name).unwrap().borrow()).await.unwrap();
-            *count = 0;
-        }
-
-        Ok(())
-    }
-
-    pub async fn close_all(&mut self) {
-        for sink in self.sinks.values_mut() {
-            //TODO: throw this error
-            sink.borrow_mut().close().await.unwrap();
-        }
-
-        self.sinks = HashMap::new();
-    }
 }
 
 #[cfg(test)]
@@ -493,13 +354,9 @@ mod tests {
             .await
             .unwrap();
 
-        println!("user stats:\n{}", stats.display_vertical());
-
-        let stats = query_column_set::<Calls<FilterUser>>(&c, None)
+        let user = query_column_set::<Calls<FilterUser>>(&c, None)
             .await
             .unwrap();
-
-        println!("user calls:\n{}", stats.display_vertical());
 
         let sorting = SortingPlan {
             order_by: Some(OrderBy {
@@ -515,12 +372,8 @@ mod tests {
             .await
             .unwrap();
 
-        println!("object stats:\n{}", stats.display_vertical());
-
         let stats = query_column_set::<Calls<FilterObject>>(&c, Some(sorting))
             .await
             .unwrap();
-
-        println!("object stats:\n{}", stats.display_vertical());
     }
 }

@@ -805,7 +805,7 @@ mod test {
     #[test]
     #[should_panic]
     fn ordering_parses_invalid() {
-        Ordering::from_str("ASC").unwrap();
+        Ordering::from_str("ASCC").unwrap();
     }
 
     #[test]

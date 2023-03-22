@@ -25,12 +25,12 @@ async fn main() {
 
     let instant = Instant::now();
 
-    let mut create_dir = s.parquet_dir().unwrap();
-    create_dir.push("create");
+    let mut data_dirs = s.parquet_dir().unwrap();
+    data_dirs.push("*");
 
-    println!("dir: {}", create_dir.to_string_lossy());
+    println!("dir: {}", data_dirs.to_string_lossy());
 
-    let lf = LazyFrame::scan_parquet(&create_dir, Default::default()).unwrap();
+    let lf = LazyFrame::scan_parquet(&data_dirs, Default::default()).unwrap();
     let df = lf
         .select([
             col("*"),
@@ -78,7 +78,4 @@ async fn main() {
     println!("df: {:#?}", df);
 
     println!("read in {}", instant.elapsed().as_secs_f64());
-    //for r in df.iter() {
-    //println!("r: {}", r);
-    //}
 }

@@ -1,4 +1,3 @@
-use alloc::borrow::Cow;
 use bytes::Bytes;
 use mysql_slowlog_parser::{
     Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatementObject, EntryStats,
@@ -6,10 +5,9 @@ use mysql_slowlog_parser::{
 };
 use polars::datatypes::ArrowDataType::{Int32, List, UInt32};
 use polars::export::arrow::array::{
-    Array, Int64Array, ListArray, MutableListArray, MutableUtf8Array, NullArray, PrimitiveArray,
-    TryPush, UInt32Array, Utf8Array,
+    Array, ListArray, MutableListArray, MutableUtf8Array, TryPush, Utf8Array,
 };
-use polars::export::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use polars::export::arrow::datatypes::{Field, Schema, TimeUnit};
 use polars::export::arrow::io::parquet::write::Encoding;
 use polars::export::arrow::io::parquet::write::Encoding::Plain;
 use polars::prelude::ArrowDataType::{Duration, Timestamp, Utf8};
@@ -69,36 +67,12 @@ impl QueryEntry {
         acc.append(&mut QueryContext::arrow2_encodings());
         acc
     }
-
-    pub fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
-        let mut acc = vec![];
-        acc.append(&mut self.sql_attributes().arrow2_arrays());
-        acc.append(&mut self.call().arrow2_arrays());
-        acc.append(&mut self.session().arrow2_arrays());
-        acc.append(&mut self.stats().arrow2_arrays());
-
-        if let Some(d) = &self.sql_attributes.statement.sql_context() {
-            let c = QueryContext(d.clone());
-            acc.append(&mut c.arrow2_arrays());
-        } else {
-            acc.append(&mut vec![
-                NullArray::new_null(DataType::Null, 1).boxed(),
-                NullArray::new_null(DataType::Null, 1).boxed(),
-                NullArray::new_null(DataType::Null, 1).boxed(),
-                NullArray::new_null(DataType::Null, 1).boxed(),
-            ]);
-        }
-
-        acc
-    }
 }
 
-trait ArrowFields {
+pub trait ArrowFields {
     fn arrow2_fields() -> Vec<ArrowField>;
 
     fn arrow2_encodings() -> Vec<Vec<Encoding>>;
-
-    fn arrow2_arrays(&self) -> Vec<Box<dyn Array>>;
 
     fn utf8_array(s: &str) -> Box<dyn Array> {
         Utf8Array::<i32>::from(&[Some(s)]).boxed()
@@ -146,29 +120,6 @@ impl ArrowFields for QuerySqlAttributes {
     fn arrow2_encodings() -> Vec<Vec<Encoding>> {
         vec![vec![Plain], vec![Plain], vec![Plain]]
     }
-
-    fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
-        let mut acc = vec![];
-
-        acc.push(Self::utf8_array(&self.sql()));
-        acc.push(Utf8Array::<i32>::from(&[Some(&self.sql())]).boxed());
-
-        let o = self.objects().unwrap_or(vec![]);
-
-        if o.len() > 0 {
-            let mut o_acc = vec![];
-
-            for o in o {
-                o_acc.push(o.full_object_name_bytes());
-            }
-
-            acc.push(Self::utf8_list_array(o_acc));
-        } else {
-            acc.push(NullArray::new_null(DataType::Null, 1).boxed());
-        }
-
-        acc
-    }
 }
 
 /// Extension of parser::EntryCall
@@ -193,15 +144,6 @@ impl ArrowFields for QueryCall {
 
     fn arrow2_encodings() -> Vec<Vec<Encoding>> {
         vec![vec![Plain], vec![Plain]]
-    }
-
-    fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
-        let mut acc = vec![];
-
-        acc.push(PrimitiveArray::from(&[Some(self.start_time().unix_timestamp())]).boxed());
-        acc.push(PrimitiveArray::from(&[Some(self.log_time().unix_timestamp())]).boxed());
-
-        acc
     }
 }
 
@@ -237,22 +179,6 @@ impl ArrowFields for QuerySession {
             vec![Plain],
         ]
     }
-
-    fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
-        let mut acc = vec![];
-
-        acc.push(Self::utf8_array(&self.user_name()));
-        acc.push(Self::utf8_array(&self.sys_user_name()));
-        acc.push(Self::utf8_array(
-            &self.host_name().clone().unwrap_or(Cow::from("localhost")),
-        ));
-        acc.push(Self::utf8_array(
-            &self.ip_address().clone().unwrap_or(Cow::from("127.0.0.1")),
-        ));
-        acc.push(UInt32Array::from(&[Some(self.thread_id())]).boxed());
-
-        acc
-    }
 }
 
 /// Extension of parser::EntryStats
@@ -280,17 +206,6 @@ impl ArrowFields for QueryStats {
     fn arrow2_encodings() -> Vec<Vec<Encoding>> {
         vec![vec![Plain], vec![Plain], vec![Plain], vec![Plain]]
     }
-
-    fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
-        let mut acc = vec![];
-
-        acc.push(Int64Array::from(&[Some((self.query_time() * 1000000.0) as i64)]).boxed());
-        acc.push(Int64Array::from(&[Some((self.lock_time() * 1000000.0) as i64)]).boxed());
-        acc.push(UInt32Array::from(&[Some(self.rows_sent())]).boxed());
-        acc.push(UInt32Array::from(&[Some(self.rows_examined())]).boxed());
-
-        acc
-    }
 }
 
 /// Extension of parser::EntryContext
@@ -317,15 +232,6 @@ impl<'a> ArrowFields for QueryContext {
 
     fn arrow2_encodings() -> Vec<Vec<Encoding>> {
         vec![vec![Plain], vec![Plain], vec![Plain], vec![Plain]]
-    }
-
-    fn arrow2_arrays(&self) -> Vec<Box<dyn Array>> {
-        vec![
-            Utf8Array::<i32>::from(&[self.request_id()]).boxed(),
-            Utf8Array::<i32>::from(&[self.caller()]).boxed(),
-            Utf8Array::<i32>::from(&[self.function()]).boxed(),
-            UInt32Array::from(&[self.line()]).boxed(),
-        ]
     }
 }
 
