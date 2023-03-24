@@ -5,18 +5,19 @@ use async_compat::{Compat, CompatExt};
 use bytes::Bytes;
 use futures::SinkExt;
 use mysql_slowlog_parser::EntrySqlType;
-use polars::export::arrow::array::{
+use arrow2::array::{
     Array, Int64Array, MutableArray, MutableListArray, MutableUtf8Array, PrimitiveArray, TryPush,
     UInt32Array, Utf8Array,
 };
-use polars::export::arrow::chunk::Chunk;
-use polars::export::arrow::io::parquet::write::{
-    CompressionOptions, FileSink, GzipLevel, Version, WriteOptions,
-};
+use arrow2::chunk::Chunk;
+//use arrow2::io::parquet::write::{
+    //CompressionOptions, FileSink, GzipLevel, Version, WriteOptions,
+//};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::swap;
 use std::path::Path;
+use arrow2::io::parquet::write::{CompressionOptions, FileSink, GzipLevel, Version, WriteOptions};
 use time::OffsetDateTime;
 use tokio::fs::File;
 
@@ -330,10 +331,8 @@ impl<'a> QueryEntrySet<'a> {
 
 #[cfg(test)]
 mod tests {
-    use polars::export::arrow::array::{
-        Array, DictionaryArray, DictionaryKey, PrimitiveArray, Utf8Array,
-    };
-    use polars::export::arrow::datatypes::DataType;
+    use arrow2::array::{Array, DictionaryArray, DictionaryKey, PrimitiveArray, Utf8Array};
+    use arrow2::datatypes::DataType;
 
     #[test]
     fn try_new_ok() {

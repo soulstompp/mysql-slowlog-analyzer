@@ -3,10 +3,13 @@
 extern crate alloc;
 extern crate core;
 
-mod arrow2;
+mod arrow;
 pub mod db;
 mod dirs;
 pub mod types;
+
+#[cfg(feature = "otlp")]
+mod metrics;
 
 use core::borrow::Borrow;
 use std::io;
@@ -14,7 +17,7 @@ use std::ops::AddAssign;
 
 use tokio::fs::File;
 
-use ::polars::error::{ArrowError, PolarsError};
+use arrow2::error::Error as ArrowError;
 
 #[doc(inline)]
 pub use crate::db::{
@@ -35,7 +38,7 @@ use crate::db::db_url;
 use crate::dirs::{DirError, SourceDataDir};
 use db::InvalidPrimaryKey;
 
-use self::arrow2::ParquetSinks;
+use self::arrow::ParquetSinks;
 use crate::types::QueryEntry;
 use tokio_util::codec::FramedRead;
 
@@ -57,10 +60,8 @@ pub enum Error {
     Reader(#[from] ReadError),
     #[error("db error: {0}")]
     SqlxError(#[from] sqlx::Error),
-    #[error("polars error: {0}")]
-    PolarsError(#[from] PolarsError),
     #[error("arrow error: {0}")]
-    ArrowError(#[from] ArrowError),
+    Arrow2Error(#[from] ArrowError),
 }
 
 pub struct LogData {

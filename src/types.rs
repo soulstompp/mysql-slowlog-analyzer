@@ -3,16 +3,12 @@ use mysql_slowlog_parser::{
     Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatementObject, EntryStats,
     SqlStatementContext,
 };
-use polars::datatypes::ArrowDataType::{Int32, List, UInt32};
-use polars::export::arrow::array::{
-    Array, ListArray, MutableListArray, MutableUtf8Array, TryPush, Utf8Array,
-};
-use polars::export::arrow::datatypes::{Field, Schema, TimeUnit};
-use polars::export::arrow::io::parquet::write::Encoding;
-use polars::export::arrow::io::parquet::write::Encoding::Plain;
-use polars::prelude::ArrowDataType::{Duration, Timestamp, Utf8};
-use polars::prelude::ArrowField;
+use arrow2::datatypes::{Field, Schema, TimeUnit};
 use std::ops::Deref;
+use arrow2::array::{Array, ListArray, MutableListArray, MutableUtf8Array, TryPush, Utf8Array};
+use arrow2::datatypes::DataType::{Duration, Int32, List, Timestamp, UInt32, Utf8};
+use arrow2::io::parquet::write::Encoding;
+use arrow2::io::parquet::write::Encoding::Plain;
 
 /// Extension of parser::Entry
 #[derive(Clone, Debug, PartialEq)]
@@ -70,7 +66,7 @@ impl QueryEntry {
 }
 
 pub trait ArrowFields {
-    fn arrow2_fields() -> Vec<ArrowField>;
+    fn arrow2_fields() -> Vec<Field>;
 
     fn arrow2_encodings() -> Vec<Vec<Encoding>>;
 
@@ -105,13 +101,13 @@ impl Deref for QuerySqlAttributes {
 }
 
 impl ArrowFields for QuerySqlAttributes {
-    fn arrow2_fields() -> Vec<ArrowField> {
+    fn arrow2_fields() -> Vec<Field> {
         vec![
-            ArrowField::new("sql", Utf8, false),
-            ArrowField::new("sql_type", Utf8, true),
-            ArrowField::new(
+            Field::new("sql", Utf8, false),
+            Field::new("sql_type", Utf8, true),
+            Field::new(
                 "objects",
-                List(Box::new(ArrowField::new("item", Utf8, false))),
+                List(Box::new(Field::new("item", Utf8, false))),
                 true,
             ),
         ]
@@ -135,7 +131,7 @@ impl Deref for QueryCall {
 }
 
 impl ArrowFields for QueryCall {
-    fn arrow2_fields() -> Vec<ArrowField> {
+    fn arrow2_fields() -> Vec<Field> {
         vec![
             Field::new("start_time", Timestamp(TimeUnit::Second, None), false),
             Field::new("log_time", Timestamp(TimeUnit::Second, None), false),
@@ -160,13 +156,13 @@ impl Deref for QuerySession {
 }
 
 impl ArrowFields for QuerySession {
-    fn arrow2_fields() -> Vec<ArrowField> {
+    fn arrow2_fields() -> Vec<Field> {
         vec![
-            ArrowField::new("user_name", Utf8, false),
-            ArrowField::new("sys_user_name", Utf8, true),
-            ArrowField::new("host_name", Utf8, true),
-            ArrowField::new("ip_address", Utf8, true),
-            ArrowField::new("thread_id", Int32, true),
+            Field::new("user_name", Utf8, false),
+            Field::new("sys_user_name", Utf8, true),
+            Field::new("host_name", Utf8, true),
+            Field::new("ip_address", Utf8, true),
+            Field::new("thread_id", Int32, true),
         ]
     }
 
@@ -194,12 +190,12 @@ impl Deref for QueryStats {
 }
 
 impl ArrowFields for QueryStats {
-    fn arrow2_fields() -> Vec<ArrowField> {
+    fn arrow2_fields() -> Vec<Field> {
         vec![
-            ArrowField::new("query_time", Duration(TimeUnit::Microsecond), false),
-            ArrowField::new("lock_time", Duration(TimeUnit::Microsecond), false),
-            ArrowField::new("rows_sent", Int32, true),
-            ArrowField::new("rows_examined", Int32, true),
+            Field::new("query_time", Duration(TimeUnit::Microsecond), false),
+            Field::new("lock_time", Duration(TimeUnit::Microsecond), false),
+            Field::new("rows_sent", Int32, true),
+            Field::new("rows_examined", Int32, true),
         ]
     }
 
@@ -221,7 +217,7 @@ impl Deref for QueryContext {
 }
 
 impl<'a> ArrowFields for QueryContext {
-    fn arrow2_fields() -> Vec<ArrowField> {
+    fn arrow2_fields() -> Vec<Field> {
         vec![
             Field::new("request_id", Utf8, true),
             Field::new("caller", Utf8, true),
