@@ -33,10 +33,10 @@ impl SourceDataDir {
         Ok(p)
     }
 
-    pub fn sqlite_dir(&self) -> Result<PathBuf, Error> {
+    pub fn duckdb_dir(&self) -> Result<PathBuf, Error> {
         let mut p = self.sample_data_dir()?;
 
-        p.push("sqlite");
+        p.push("duckdb");
 
         Ok(p)
     }

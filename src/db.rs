@@ -4,12 +4,12 @@ use crate::types::{
 };
 use crate::Error;
 use alloc::borrow::Cow;
-use core::borrow::BorrowMut;
 use core::fmt::{Display, Formatter};
 use core::str::FromStr;
+use duckdb::params;
+use duckdb::{Connection, Row, Transaction};
+use log::debug;
 use mysql_slowlog_parser::SqlStatementContext;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::ops::AddAssign;
 use std::path::Path;
 
@@ -24,51 +24,34 @@ impl Display for InvalidPrimaryKey {
     }
 }
 
-pub async fn open_db(p: Option<&Path>) -> Result<SqlitePool, Error> {
-    let pool_timeout = 30;
-    let concurrency = 50;
-
-    let pool_max_connections = if concurrency == 1 {
-        2
-    } else {
-        concurrency as u32
+pub async fn open_db(p: Option<&Path>) -> Result<Connection, Error> {
+    let conn = match p {
+        Some(p) => Connection::open(p)?,
+        None => Connection::open_in_memory()?,
     };
 
-    let connection_options = SqliteConnectOptions::from_str(&db_url(p))?
-        //    .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .serialized(true)
-        .foreign_keys(false)
-        .busy_timeout(std::time::Duration::from_secs(pool_timeout));
-
-    let db = SqlitePoolOptions::new()
-        .max_connections(pool_max_connections)
-        .connect_with(connection_options)
-        .await?;
-
-    sqlx::migrate!("./migrations").run(&db).await?;
-
-    Ok(db)
+    Ok(conn)
 }
 
 pub fn db_url(p: Option<&Path>) -> String {
     match p {
-        Some(p) => format!("sqlite://{}", p.to_string_lossy()),
-        None => format!("sqlite://:memory:"),
+        Some(p) => format!("duckdb://{}", p.to_string_lossy()),
+        None => format!("duckdb://:memory:"),
     }
 }
 
-pub async fn record_entry(c: SqlitePool, e: QueryEntry) -> Result<u32, Error> {
-    let mut tx = c.begin().await?;
+pub async fn record_entry(c: &mut Connection, e: QueryEntry) -> Result<u32, Error> {
+    let mut tx = Transaction::new(c)?;
 
     let query_call_id = insert_entry(&mut tx, e).await?;
 
-    tx.commit().await?;
+    tx.commit()?;
 
     Ok(query_call_id)
 }
 
-pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: QueryEntry) -> Result<u32, Error> {
+pub async fn insert_entry(tx: &mut Transaction<'_>, e: QueryEntry) -> Result<u32, Error> {
+    debug!("inserting entry");
     let query_id = insert_query(tx, e.sql_attributes()).await?;
 
     let query_call_id = insert_query_call(
@@ -77,10 +60,7 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: QueryEntry) -> Re
             query_id,
             query_call: e.call(),
         },
-    )
-    .await?;
-
-    println!("inserted query call");
+    )?;
 
     let _ = insert_query_session(
         tx,
@@ -91,16 +71,13 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: QueryEntry) -> Re
     )
     .await?;
 
-    println!("inserted a query call id");
-
     let _ = insert_query_stats(
         tx,
         InsertQueryStatsParams {
             query_call_id,
             stats: e.stats(),
         },
-    )
-    .await?;
+    )?;
 
     if let Some(c) = e.sql_attributes().statement.sql_context() {
         let _ = insert_query_context(
@@ -114,69 +91,55 @@ pub async fn insert_entry(tx: &mut Transaction<'_, Sqlite>, e: QueryEntry) -> Re
                     line: c.line.clone(),
                 }),
             },
-        )
-        .await?;
+        );
     }
-
-    println!("got query context");
 
     Ok(query_call_id)
 }
 
-async fn find_query(
-    tx: &mut Transaction<'_, Sqlite>,
-    params: &QuerySqlAttributes,
-) -> Result<u32, Error> {
-    let r = sqlx::query("SELECT id FROM db_ojects WHERE schema = ?")
-        .bind(params.sql())
-        .fetch_one(tx)
-        .await?;
-
-    let id = r.try_get(0)?;
+async fn find_query(tx: &mut Transaction<'_>, params: &QuerySqlAttributes) -> Result<u32, Error> {
+    debug!("find_query: {:?}", params);
+    let id = tx.query_row(
+        "SELECT id FROM queries WHERE sql = ?",
+        params![params.sql()],
+        |row| row.get(0),
+    )?;
 
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
 async fn find_db_object(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_>,
     schema: Option<Cow<'_, str>>,
     object_name: Cow<'_, str>,
 ) -> Result<u32, Error> {
-    let r = sqlx::query(
-        format!(
-            "SELECT id from db_objects WHERE table_name = ? AND schema name {}",
-            schema.clone().map_or("IS ?", |_| "= ?")
-        )
-        .as_str(),
-    )
-    .bind(object_name)
-    .bind(schema)
-    .fetch_one(tx)
-    .await?;
-
-    let id = r.try_get(0)?;
+    debug!(
+        "find_db_object: schema: {:?}, object_name: {:?}",
+        schema, object_name
+    );
+    let id = tx.query_row(
+        "SELECT id from db_objects WHERE table_name = ? AND schema name {}",
+        params![object_name],
+        |row| row.get(0),
+    )?;
 
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
-async fn insert_query(
-    tx: &mut Transaction<'_, Sqlite>,
-    params: QuerySqlAttributes,
-) -> Result<u32, Error> {
+async fn insert_query(tx: &mut Transaction<'_>, params: QuerySqlAttributes) -> Result<u32, Error> {
+    debug!("insert_query: {:?}", params);
     if let Ok(id) = find_query(tx, &params).await {
         return Ok(id);
     }
-
-    let result = sqlx::query("INSERT INTO queries (sql, sql_type) VALUES (?, ?)")
-        .bind(&params.sql())
-        .bind(&params.sql_type().and_then(|t| Some(t.to_string())))
-        .execute(tx.borrow_mut())
-        .await
+    //TODO: handle error
+    //TODO: handle error
+    let id = tx
+        .query_row(
+            "INSERT INTO queries (sql, sql_type) VALUES (?1, ?2) RETURNING queries.id",
+            params![params.sql(), params.sql_type().map(|et| et.to_string())],
+            |row| row.get(0),
+        )
         .unwrap();
-
-    let id = result.last_insert_rowid();
-
-    let id = u32::try_from(id).or::<Error>(Err(InvalidPrimaryKey { value: id }.into()))?;
 
     insert_query_objects(tx, id, params).await?;
 
@@ -184,23 +147,19 @@ async fn insert_query(
 }
 
 async fn insert_query_objects(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_>,
     query_id: u32,
     params: QuerySqlAttributes,
 ) -> Result<(), Error> {
+    debug!("insert_query_objects: {:?}", params);
     if let Some(l) = params.objects() {
         for o in l {
             let db_object_id = insert_db_objects(tx, QuerySqlStatementObjects(o)).await?;
 
-            let _ = sqlx::query(
-                "INSERT INTO query_objects (query_id, db_object_id) VALUES \
-            (?, ?)",
-            )
-            .bind(query_id)
-            .bind(db_object_id)
-            .execute(tx.borrow_mut())
-            .await
-            .unwrap();
+            let _ = tx.execute(
+                "INSERT INTO query_objects (query_id, db_object_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                params![query_id, db_object_id],
+            )?;
         }
     }
 
@@ -208,136 +167,140 @@ async fn insert_query_objects(
 }
 
 async fn insert_db_objects(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_>,
     object: QuerySqlStatementObjects,
 ) -> Result<u32, Error> {
+    debug!("insert_db_objects: {:?}", object);
     if let Ok(id) = find_db_object(tx, object.schema_name(), object.object_name()).await {
         return Ok(id);
     }
 
-    let result = sqlx::query("INSERT INTO db_objects (schema_name, object_name) VALUES (?, ?)")
-        .bind(object.schema_name())
-        .bind(object.object_name())
-        .execute(tx)
-        .await
-        .unwrap();
-
-    let id = result.last_insert_rowid();
+    let id = tx.query_row(
+        "INSERT INTO db_objects (schema_name, object_name) VALUES (?, ?) RETURNING db_objects.id",
+        params![object.schema_name(), object.object_name()],
+        |row| row.get(0),
+    )?;
 
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
+#[derive(Debug)]
 struct InsertQueryCallParams {
     query_id: u32,
     query_call: QueryCall,
 }
 
-async fn insert_query_call(
-    tx: &mut Transaction<'_, Sqlite>,
+fn insert_query_call(
+    tx: &mut Transaction<'_>,
     params: InsertQueryCallParams,
 ) -> Result<u32, Error> {
-    let result = sqlx::query(
-        "INSERT INTO query_calls (query_id, start_time, log_time)
-                 VALUES (?, ?, ?)
-            ",
-    )
-    .bind(params.query_id)
-    .bind(&params.query_call.start_time())
-    .bind(&params.query_call.log_time())
-    .execute(tx)
-    .await?;
-
-    let id = result.last_insert_rowid();
+    debug!("insert_query_call: {:?}", params);
+    let id = tx.query_row(
+        "INSERT INTO query_calls (query_id, start_time)
+             VALUES ($1, $2) RETURNING query_calls.id",
+        params![
+            params.query_id,
+            params.query_call.log_time.into_fixed_offset().unwrap(),
+        ],
+        |row| row.get(0),
+    )?;
 
     u32::try_from(id).or(Err(InvalidPrimaryKey { value: id }.into()))
 }
 
+#[derive(Debug)]
 struct InsertQuerySessionParams {
     query_call_id: u32,
     session: QuerySession,
 }
 
 async fn insert_query_session(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_>,
     params: InsertQuerySessionParams,
 ) -> Result<(), Error> {
-    sqlx::query(
+    debug!("insert_query_session: {:?}", params);
+    let _ = tx.execute(
         "INSERT INTO query_call_session (query_call_id, user_name, sys_user_name, host_name,
         ip_address, thread_id)
-        VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(params.query_call_id)
-    .bind(params.session.user_name())
-    .bind(params.session.sys_user_name())
-    .bind(params.session.host_name())
-    .bind(params.session.ip_address())
-    .bind(params.session.thread_id())
-    .execute(tx)
-    .await?;
+        VALUES ($1, $2, $3, $4, $5, $6)",
+        params![
+            params.query_call_id,
+            params.session.user_name(),
+            params.session.sys_user_name(),
+            params.session.host_name(),
+            params.session.ip_address(),
+            params.session.thread_id()
+        ],
+    )?;
 
     Ok(())
 }
 
+#[derive(Debug)]
 struct InsertQueryStatsParams {
     query_call_id: u32,
     stats: QueryStats,
 }
 
-async fn insert_query_stats(
-    tx: &mut Transaction<'_, Sqlite>,
+fn insert_query_stats(
+    tx: &mut Transaction<'_>,
     params: InsertQueryStatsParams,
 ) -> Result<(), Error> {
-    let _ = sqlx::query(
+    debug!("insert_query_stats: {:?}", params);
+    let _ = tx.execute(
         "INSERT INTO query_call_stats (query_call_id, query_time, lock_time, rows_sent, rows_examined)
-        VALUES (?, ?, ?, ?, ?)")
-        .bind(&params.query_call_id)
-        .bind(&params.stats.query_time())
-        .bind(&params.stats.lock_time())
-        .bind(&params.stats.rows_sent())
-        .bind(&params.stats.rows_examined())
-        .execute(tx)
-        .await?;
+        VALUES ($1, $2, $3, $4, $5)",
+        params![
+            &params.query_call_id,
+            &params.stats.query_time(),
+            &params.stats.lock_time(),
+            &params.stats.rows_sent(),
+            &params.stats.rows_examined(),
+        ],
+    )?;
 
     Ok(())
 }
 
+#[derive(Debug)]
 struct InsertQueryContextParams {
     query_call_id: u32,
     context: QueryContext,
 }
 
-async fn insert_query_context(
-    tx: &mut Transaction<'_, Sqlite>,
+fn insert_query_context(
+    tx: &mut Transaction<'_>,
     params: InsertQueryContextParams,
 ) -> Result<(), Error> {
-    let _ = sqlx::query(
+    debug!("inserting query: {:?}", params);
+    let _ = tx.execute(
         "INSERT INTO query_call_context (query_call_id, request_id, caller, function, line)
-        VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(&params.query_call_id)
-    .bind(&params.context.caller())
-    .bind(&params.context.function())
-    .bind(&params.context.line())
-    .execute(tx)
-    .await?;
+        VALUES ($1, $2, $3, $4, $5)",
+        params![
+            &params.query_call_id,
+            &params.context.caller(),
+            &params.context.function(),
+            &params.context.line(),
+        ],
+    )?;
 
     Ok(())
 }
 
 pub trait ColumnSet: Sized {
     fn sql(s: &Option<SortingPlan>) -> String {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(Self::set_sql(s));
+        let mut qb = Self::set_sql(s);
 
         if let Some(s) = s {
             s.sql_clauses(&mut qb);
         }
 
-        qb.into_sql()
+        qb
     }
 
     fn set_sql(s: &Option<SortingPlan>) -> String;
 
-    fn from_row(r: SqliteRow) -> Result<Self, Error>;
+    fn from_row(r: &Row) -> Result<Self, Error>;
 
     fn columns() -> Vec<String>;
 
@@ -376,14 +339,14 @@ pub trait ColumnSet: Sized {
     fn display_values(&self) -> Vec<(&str, String)>;
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct AggregateStats<C> {
-    query_time: f64,
-    lock_time: f64,
-    rows_sent: f64,
-    rows_examined: f64,
-    calls: u32,
-    filter: C,
+    pub query_time: f64,
+    pub lock_time: f64,
+    pub rows_sent: u32,
+    pub rows_examined: u32,
+    pub calls: u32,
+    pub filter: C,
 }
 
 impl<C: ColumnSet> ColumnSet for AggregateStats<C> {
@@ -409,16 +372,17 @@ impl<C: ColumnSet> ColumnSet for AggregateStats<C> {
         )
     }
 
-    fn from_row(r: SqliteRow) -> Result<Self, Error> {
+    fn from_row(r: &Row) -> Result<Self, Error> {
         Ok(Self {
-            query_time: r.try_get("query_time")?,
-            lock_time: r.try_get("lock_time")?,
-            rows_sent: r.try_get("rows_sent")?,
-            rows_examined: r.try_get("rows_examined")?,
-            calls: r.try_get("calls")?,
-            filter: C::from_row(r)?,
+            calls: r.get("calls")?,
+            query_time: r.get("query_time")?,
+            lock_time: r.get("lock_time")?,
+            rows_sent: r.get("rows_sent")?,
+            rows_examined: r.get("rows_examined")?,
+            filter: C::from_row(&r)?,
         })
     }
+
     fn columns() -> Vec<String> {
         vec![
             "calls".into(),
@@ -447,9 +411,10 @@ impl<C: ColumnSet> ColumnSet for AggregateStats<C> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Calls<F> {
-    calls: u32,
-    filter: F,
+    pub calls: u32,
+    pub filter: F,
 }
 
 impl<C: ColumnSet> ColumnSet for Calls<C> {
@@ -471,9 +436,9 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
         )
     }
 
-    fn from_row(r: SqliteRow) -> Result<Self, Error> {
+    fn from_row(r: &Row) -> Result<Self, Error> {
         Ok(Self {
-            calls: r.try_get("calls")?,
+            calls: r.get("calls")?,
             filter: C::from_row(r)?,
         })
     }
@@ -506,10 +471,8 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 /// use mysql_slowlog_analyzer::Error;
 ///         use std::collections::BTreeMap;
 ///
-/// use sqlx::sqlite::SqliteRow;
-/// use sqlx::Row;
-/// use sqlx::FromRow;
 /// use mysql_slowlog_analyzer::types::QueryStats;
+/// use duckdb::Row;
 ///
 ///#[derive(Debug)]
 ///struct StatsBySql {
@@ -519,20 +482,21 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 /// impl ColumnSet for StatsBySql {
 ///     fn set_sql(_: &Option<SortingPlan>) -> String {
 ///        use mysql_slowlog_analyzer::db::SortingPlan;
-/// format!("
-///        SELECT q.sql, qc.id AS query_call_id
+///
+///        r"SELECT q.sql, qc.id AS query_call_id
 ///        FROM query_calls qc
 ///        JOIN queries q ON q.id = qc.query_id
-///         ")
+///         ".to_string()
 ///     }
 ///
 ///     fn key() -> String {
-///         format!("query_call_id")
+///         "query_call_id".to_string()
 ///     }
 ///
-///     fn from_row(r: SqliteRow) -> Result<Self, Error> {
-///         Ok(Self {
-///            sql: r.try_get("sql")?,
+///     fn from_row(r: &Row) -> Result<Self, Error> {
+///         use duckdb::Row;
+/// Ok(Self {
+///            sql: r.get("sql")?,
 ///         })
 ///     }
 ///
@@ -543,11 +507,9 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 ///     }
 ///
 ///     fn display_values(&self) -> Vec<(&str, String)> {
-///         let mut acc = vec![];
-///
-///          acc.push(("sql", self.sql.to_string()));
-///
-///          acc
+///         vec![
+///             ("sql", self.sql.to_string())
+///         ]
 ///     }
 /// }
 ///
@@ -570,12 +532,13 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 ///
 ///     let context = LogDataConfig {
 ///         data_path: Some(data_dir),
+///         codec_config: Default::default(),
 ///     };
 ///
 ///     let mut s = LogData::open(&p, context).await.unwrap();
 ///     s.record_db().await.unwrap();
 ///
-///     let c = s.db_pool();
+///     let c = s.connection();
 ///
 ///     let sorting = SortingPlan {
 ///         order_by: Some(OrderBy { columns: vec![OrderedColumn::from_str("calls DESC").unwrap()] }),
@@ -587,17 +550,23 @@ impl<C: ColumnSet> ColumnSet for Calls<C> {
 ///
 ///     let stats = query_column_set::<AggregateStats<StatsBySql>>(&c, Some(sorting)).await.unwrap();
 ///
-///     panic!("stats:\n{}", stats.display_vertical());
+///     stats.display_vertical();
 /// }
 /// ```
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct RelationalObject<A> {
     rows: Vec<A>,
 }
 
+impl<A> RelationalObject<A> {
+    pub fn rows(&self) -> &Vec<A> {
+        &self.rows
+    }
+}
+
 impl<C: ColumnSet> RelationalObject<C> {
-    pub fn display_vertical(&self) -> String {
+    pub fn display_vertical(&self) {
         let (_, out) = self
             .rows
             .iter()
@@ -616,7 +585,7 @@ impl<C: ColumnSet> RelationalObject<C> {
                 (i, acc)
             });
 
-        out
+        println!("{}", out);
     }
 }
 
@@ -722,13 +691,17 @@ pub struct OrderBy {
 }
 
 impl OrderBy {
-    fn sql_clause(&self, b: &mut QueryBuilder<Sqlite>) {
-        b.push("\nORDER BY ");
+    fn sql_clause(&self, b: &mut String) {
+        b.push_str("\nORDER BY ");
 
-        let mut seperated = b.separated(", ");
+        let i = 0;
 
         for c in &self.columns {
-            seperated.push(c.to_string());
+            if i > 0 {
+                b.push_str(", ");
+            }
+
+            b.push_str(&c.to_string());
         }
     }
 }
@@ -740,16 +713,15 @@ pub struct Limit {
 }
 
 impl Limit {
-    fn sql_clause(&self, b: &mut QueryBuilder<Sqlite>) {
-        b.push("\nLIMIT");
+    fn sql_clause(&self, b: &mut String) {
+        b.push_str("\nLIMIT");
 
-        let mut seperated = b.separated(",");
+        b.push_str(&format!(" {}", self.limit));
 
         if let Some(o) = &self.offset {
-            seperated.push(format!(" {}", o));
+            b.push_str("\nOFFSET");
+            b.push_str(&format!(" {}", o));
         }
-
-        seperated.push(&format!(" {}", self.limit));
     }
 }
 
@@ -760,7 +732,7 @@ pub struct SortingPlan {
 }
 
 impl SortingPlan {
-    fn sql_clauses(&self, b: &mut QueryBuilder<Sqlite>) {
+    fn sql_clauses(&self, b: &mut String) {
         if let Some(o) = &self.order_by {
             o.sql_clause(b);
         }
@@ -772,18 +744,21 @@ impl SortingPlan {
 }
 
 pub async fn query_column_set<C: ColumnSet>(
-    c: &SqlitePool,
+    c: &Connection,
     s: Option<SortingPlan>,
 ) -> Result<RelationalObject<C>, Error> {
     let sql = C::sql(&s);
 
-    println!("sql: {}", sql);
-    let rows = sqlx::query(&sql).fetch_all(c).await?;
+    debug!("running query_column_set sql: {}", sql);
+
+    let mut stmt = c.prepare_cached(&sql)?;
+
+    let mut rows = stmt.query(params![])?;
 
     let mut acc = vec![];
 
-    for r in rows.into_iter() {
-        let f = C::from_row(r)?;
+    while let Some(row) = rows.next()? {
+        let f = C::from_row(row)?;
         acc.push(f);
     }
 
