@@ -3,7 +3,14 @@ name = "mysql-slowlog-analyzer"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "slowlog"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 directories = "4.0.1"
 mysql-slowlog-parser = { version = "0.5.0" }
 winnow_datetime = { version = "0.3.0", features = ["time"] }

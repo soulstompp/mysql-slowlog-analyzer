@@ -9,7 +9,7 @@ mod metrics;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use mysql_slowlog_parser::EntryCodec;
+use mysql_slowlog_parser::{EntryCodec, EntryCodecConfig};
 use polars::prelude::PolarsError;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,8 +24,6 @@ pub enum Error {
     LogAlreadyRecorded,
     #[error("{0}")]
     DirError(#[from] DirError),
-    #[error("duck db error: {0}")]
-    DuckDbError(#[from] DuckDbError),
     #[error("io error: {0}")]
     IO(#[from] io::Error),
     #[error("reader error: {0}")]
@@ -37,6 +35,7 @@ pub enum Error {
 pub struct LogData {
     path: PathBuf,
     dirs: SourceDataDir,
+    codec_config: EntryCodecConfig,
 }
 
 impl LogData {
@@ -46,6 +45,7 @@ impl LogData {
         Ok(Self {
             path: p.to_path_buf(),
             dirs,
+            codec_config: config.codec_config,
         })
     }
 
@@ -107,7 +107,7 @@ impl LogData {
         let f = File::open(&self.path).await?;
         Ok(FramedRead::with_capacity(
             f,
-            EntryCodec::new(self.config.codec_config),
+            EntryCodec::new(self.codec_config),
             30000000,
         ))
     }
@@ -136,6 +136,7 @@ mod tests {
 
         let config = LogDataConfig {
             data_path: Some(data_dir),
+            codec_config: Default::default(),
         };
 
         let mut s = LogData::open(&p, config).await.unwrap();
