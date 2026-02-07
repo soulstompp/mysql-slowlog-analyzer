@@ -1,179 +1,106 @@
-#![feature(associated_type_defaults)]
-#[macro_use]
-extern crate alloc;
-extern crate core;
-
-pub mod db;
+mod aggregate;
 mod dirs;
+mod parquet;
 pub mod types;
 
-use std::fs::remove_dir_all;
-use std::ops::AddAssign;
-use std::{fs, io};
+#[cfg(feature = "otlp")]
+mod metrics;
 
-use tokio::fs::File;
-
-#[doc(inline)]
-pub use crate::db::{
-    open_db, query_column_set, record_entry, ColumnSet, OrderBy, OrderedColumn, Ordering,
-    RelationalObject, SortingPlan,
-};
-use duckdb::Connection;
-use futures::StreamExt;
-use mysql_slowlog_parser::{CodecError, EntryCodec, EntryCodecConfig, ReadError};
-use sha2::{Digest, Sha256};
+use std::io;
 use std::path::{Path, PathBuf};
+
+use mysql_slowlog_parser::EntryCodec;
+use polars::prelude::PolarsError;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::fs::create_dir_all;
-
-use crate::dirs::{DirError, SourceDataDir};
-use db::InvalidPrimaryKey;
-
-use crate::types::QueryEntry;
+use tokio::fs::{create_dir_all, File};
 use tokio_util::codec::FramedRead;
 
-use duckdb::Error as DuckDbError;
-use log::debug;
+use crate::dirs::{DirError, SourceDataDir};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("this log has already recorded, delete the corresponding directoru to record again")]
-    LogAlreadyRecorded(String),
-    #[error("chrono date parsing error: {0}")]
-    ChronoParseError(chrono::ParseError),
+    #[error("this log has already been recorded, delete the corresponding directory to record again")]
+    LogAlreadyRecorded,
     #[error("{0}")]
     DirError(#[from] DirError),
     #[error("duck db error: {0}")]
     DuckDbError(#[from] DuckDbError),
     #[error("io error: {0}")]
     IO(#[from] io::Error),
-    #[error("invalid primary key: {0}")]
-    InvalidPrimaryKey(#[from] InvalidPrimaryKey),
-    #[error("invalid order by clause: {0}")]
-    InvalidOrderBy(String),
     #[error("reader error: {0}")]
-    Reader(#[from] ReadError),
-    #[error("codec error: {0}")]
-    CodecError(#[from] CodecError),
+    Reader(#[from] mysql_slowlog_parser::ReadError),
+    #[error("polars error: {0}")]
+    Polars(#[from] PolarsError),
 }
 
 pub struct LogData {
     path: PathBuf,
     dirs: SourceDataDir,
-    connection: Connection,
-    config: LogDataConfig,
-    context: LogDataContext,
 }
 
 impl LogData {
     pub async fn open(p: &Path, config: LogDataConfig) -> Result<Self, Error> {
-        let mut context = LogDataContext { db_recorded: false };
-
-        let dirs = Self::data_dir(p, config.clone()).await?;
-
-        let duckdb_path = dirs.duckdb_dir()?;
-
-        create_dir_all(&duckdb_path).await?;
-
-        let mut dbp = duckdb_path.clone();
-        dbp.push("entries");
-
-        if dbp.exists() {
-            debug!("db path exists: {}", dbp.display());
-            context.db_recorded = true;
-        }
-
-        debug!("db path: {}", dbp.display());
-        let pool = open_db(Some(&dbp)).await?;
+        let dirs = Self::data_dir(p, &config).await?;
 
         Ok(Self {
             path: p.to_path_buf(),
             dirs,
-            connection: pool,
-            config: config.clone(),
-            context,
         })
     }
 
-    async fn data_dir(p: &Path, config: LogDataConfig) -> Result<SourceDataDir, Error> {
-        let f = File::open(&p).await?;
+    async fn data_dir(p: &Path, config: &LogDataConfig) -> Result<SourceDataDir, Error> {
+        let f = File::open(p).await?;
 
         let mut hash = Sha256::default();
-
         io::copy(&mut f.into_std().await, &mut hash)?;
-
         let hash = format!("{:x}", hash.finalize());
 
-        let dirs = SourceDataDir {
-            hash: hash.to_string(),
-            data_dir: config.data_path.as_ref().map(|p| p.to_path_buf()),
-        };
-
-        Ok(dirs)
+        Ok(SourceDataDir {
+            hash,
+            data_dir: config.data_path.clone(),
+        })
     }
 
     pub fn parquet_dir(&self) -> Result<PathBuf, Error> {
         self.dirs.parquet_dir()
     }
 
-    pub fn duckdb_dir(&self) -> Result<PathBuf, Error> {
-        self.dirs.duckdb_dir()
+    pub fn raw_parquet_path(&self) -> Result<PathBuf, Error> {
+        self.dirs.raw_parquet_path()
     }
 
-    pub fn setup_db_tables(&mut self) -> Result<(), Error> {
-        let init_sql = fs::read_to_string("migrations/init.sql")?;
-
-        let c = self.connection();
-
-        c.execute_batch(init_sql.as_str())?;
-
-        Ok(())
+    pub fn bucketed_parquet_path(&self) -> Result<PathBuf, Error> {
+        self.dirs.bucketed_parquet_path()
     }
 
-    pub async fn record_db(&mut self) -> Result<(), Error> {
-        if self.context.db_recorded {
-            //return Err(Error::LogAlreadyRecorded(self.context.config.data_path.clone().unwrap_or(PathBuf::from(":memory:")).to_string_lossy().to_string()));
-            debug!("database has already been recorded");
-            return Ok(());
+    /// Parse the slow log and write a raw parquet file. Returns the path to the written file.
+    pub async fn record_raw(&mut self) -> Result<PathBuf, Error> {
+        let raw_path = self.dirs.raw_parquet_path()?;
+
+        if raw_path.exists() {
+            return Ok(raw_path);
         }
 
-        debug!("recording db");
-        self.setup_db_tables()?;
+        let parquet_dir = self.dirs.parquet_dir()?;
+        create_dir_all(&parquet_dir).await?;
 
-        let mut r = self.reader().await?;
+        let mut reader = self.reader().await?;
+        parquet::write_raw_parquet(&mut reader, &raw_path).await?;
 
-        let c = self.connection();
-
-        let mut i = 0;
-
-        while let Some(res) = r.next().await {
-            let e = res?;
-            let _ = record_entry(c, QueryEntry(e)).await?;
-            i.add_assign(1);
-        }
-
-        self.context.db_recorded = true;
-
-        Ok(())
+        Ok(raw_path)
     }
 
-    pub async fn drop_db(p: &Path, config: LogDataConfig) -> Result<(), Error> {
-        let dirs = LogData::data_dir(p, config).await?;
-        let duckdb_path = dirs.duckdb_dir()?;
-        let db_file = duckdb_path.join("entries");
+    /// Parse and aggregate into time-bucketed parquet. Writes raw first if needed.
+    /// `bucket_duration` is a polars duration string, e.g. "1s", "5m", "1h". Defaults to "1s".
+    pub async fn record_bucketed(&mut self, bucket_duration: Option<&str>) -> Result<PathBuf, Error> {
+        let bucket_duration = bucket_duration.unwrap_or("1s");
+        let raw_path = self.record_raw().await?;
+        let bucketed_path = self.dirs.bucketed_parquet_path()?;
 
-        if db_file.exists() {
-            remove_dir_all(&duckdb_path)?;
-            debug!("Database dropped: {}", db_file.display());
-        } else {
-            debug!("Database file does not exist: {}", db_file.display());
-        }
+        aggregate::write_bucketed_parquet(&raw_path, &bucketed_path, bucket_duration)?;
 
-        Ok(())
-    }
-
-    pub fn connection(&mut self) -> &mut Connection {
-        &mut self.connection
+        Ok(bucketed_path)
     }
 
     pub async fn reader(&self) -> Result<FramedRead<File, EntryCodec>, Error> {
@@ -192,206 +119,106 @@ pub struct LogDataConfig {
     pub codec_config: EntryCodecConfig,
 }
 
-#[derive(Debug, Default)]
-pub struct LogDataContext {
-    db_recorded: bool,
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::db::{AggregateStats, Calls, Limit, OrderBy, OrderedColumn, SortingPlan};
-    use crate::Error;
-    use crate::{query_column_set, ColumnSet, LogData, LogDataConfig};
-    use core::str::FromStr;
-    use duckdb::Row;
+    use crate::{LogData, LogDataConfig};
+    use std::fs::{metadata, remove_dir_all};
     use std::path::PathBuf;
 
-    #[derive(Debug, PartialEq)]
-    struct FilterUser {
-        user_name: String,
-        host_name: String,
-    }
+    #[tokio::test]
+    async fn can_record_raw() {
+        let p = PathBuf::from("data/slow-test-queries.log");
+        let data_dir = PathBuf::from("/tmp/can_record_raw");
 
-    impl ColumnSet for FilterUser {
-        fn set_sql(_: &Option<SortingPlan>) -> String {
-            r#"
-            SELECT qs.user_name, qs.host_name, qc.id AS query_call_id
-            FROM query_calls qc
-            JOIN query_call_session qs ON qs.query_call_id = qc.id
-        "#
-            .to_string()
+        if metadata(&data_dir).is_ok() {
+            remove_dir_all(&data_dir).unwrap();
         }
 
-        fn from_row(r: &Row) -> Result<Self, Error> {
-            Ok(Self {
-                user_name: r.get("user_name")?,
-                host_name: r.get("host_name")?,
-            })
-        }
+        let config = LogDataConfig {
+            data_path: Some(data_dir),
+        };
 
-        fn columns() -> Vec<String> {
-            vec!["user_name".to_string(), "host_name".to_string()]
-        }
+        let mut s = LogData::open(&p, config).await.unwrap();
+        let raw_path = s.record_raw().await.unwrap();
 
-        fn key() -> String {
-            "query_call_id".to_string()
-        }
+        assert!(raw_path.exists());
 
-        fn display_values(&self) -> Vec<(&str, String)> {
-            vec![
-                ("user_name", self.user_name.to_string()),
-                ("host_name", self.host_name.to_string()),
-            ]
-        }
-    }
+        // Verify the file is readable and has expected columns
+        let lf = polars::prelude::LazyFrame::scan_parquet(&raw_path, Default::default()).unwrap();
+        let df = lf.collect().unwrap();
 
-    #[derive(Debug, PartialEq)]
-    struct FilterObject {
-        schema_name: Option<String>,
-        object_name: String,
-    }
+        assert!(df.height() > 0, "raw parquet should have rows");
 
-    impl ColumnSet for FilterObject {
-        fn set_sql(_: &Option<SortingPlan>) -> String {
-            r#"
-            SELECT dbo.schema_name, dbo.object_name, qc.id AS query_call_id
-            FROM db_objects dbo
-            JOIN query_objects qo ON qo.db_object_id = dbo.id
-            JOIN query_calls qc ON qc.query_id = qo.query_id
-            "#
-            .to_string()
-        }
+        let expected_cols = [
+            "sql", "sql_type", "objects", "start_time", "log_time",
+            "user_name", "sys_user_name", "host_name", "ip_address", "thread_id",
+            "query_time", "lock_time", "rows_sent", "rows_examined",
+            "request_id", "caller", "function", "line",
+        ];
 
-        fn from_row(r: &Row) -> Result<Self, Error> {
-            Ok(Self {
-                schema_name: r.get("schema_name")?,
-                object_name: r.get("object_name")?,
-            })
-        }
-
-        fn columns() -> Vec<String> {
-            vec!["schema_name".into(), "object_name".into()]
-        }
-
-        fn key() -> String {
-            "query_call_id".to_string()
-        }
-
-        fn display_values(&self) -> Vec<(&str, String)> {
-            vec![
-                (
-                    "schema_name",
-                    self.schema_name
-                        .clone()
-                        .unwrap_or("NULL".into())
-                        .to_string(),
-                ),
-                ("object_name", self.object_name.to_string()),
-            ]
+        for col in expected_cols {
+            assert!(
+                df.column(col).is_ok(),
+                "raw parquet should have column '{}'",
+                col
+            );
         }
     }
 
     #[tokio::test]
-    async fn can_record_db() {
+    async fn can_record_bucketed() {
         let p = PathBuf::from("data/slow-test-queries.log");
+        let data_dir = PathBuf::from("/tmp/can_record_bucketed");
 
-        let data_dir = PathBuf::from("/tmp/can_record_db");
+        if metadata(&data_dir).is_ok() {
+            remove_dir_all(&data_dir).unwrap();
+        }
 
-        let context = LogDataConfig {
+        let config = LogDataConfig {
             data_path: Some(data_dir),
             codec_config: Default::default(),
         };
 
-        LogData::drop_db(&p, context.clone()).await.unwrap();
+        let mut s = LogData::open(&p, config).await.unwrap();
+        let bucketed_path = s.record_bucketed(None).await.unwrap();
 
-        let mut s = LogData::open(&p, context).await.unwrap();
+        assert!(bucketed_path.exists());
 
-        s.record_db().await.unwrap();
+        let lf =
+            polars::prelude::LazyFrame::scan_parquet(&bucketed_path, Default::default()).unwrap();
+        let df = lf.collect().unwrap();
 
-        let c = s.connection();
+        assert!(df.height() > 0, "bucketed parquet should have rows");
 
-        let user_sorting = SortingPlan {
-            order_by: Some(OrderBy {
-                columns: vec![OrderedColumn::from_str("user_name ASC").unwrap()],
-            }),
-            limit: Some(Limit {
-                limit: 1,
-                offset: None,
-            }),
-        };
+        let expected_cols = [
+            "time_bucket",
+            "sql",
+            "sql_type",
+            "execution_count",
+            "query_time_min",
+            "query_time_max",
+            "query_time_avg",
+            "query_time_p95",
+            "lock_time_min",
+            "lock_time_max",
+            "lock_time_avg",
+            "lock_time_p95",
+            "rows_sent_min",
+            "rows_sent_max",
+            "rows_sent_avg",
+            "rows_sent_p95",
+            "rows_examined_min",
+            "rows_examined_max",
+            "rows_examined_avg",
+            "rows_examined_p95",
+        ];
 
-        let res = query_column_set::<AggregateStats<FilterUser>>(c, Some(user_sorting.clone()))
-            .await
-            .unwrap();
-
-        let expected = [AggregateStats {
-            query_time: 0.01570645160973072,
-            lock_time: 0.00014193548122420907,
-            rows_sent: 0,
-            rows_examined: 0,
-            calls: 310,
-            filter: FilterUser {
-                user_name: "msandbox".to_string(),
-                host_name: "localhost".to_string(),
-            },
-        }];
-
-        assert_eq!(res.rows(), &expected);
-
-        let res = query_column_set::<Calls<FilterUser>>(c, Some(user_sorting.clone()))
-            .await
-            .unwrap();
-
-        let expected = vec![Calls {
-            calls: 310,
-            filter: FilterUser {
-                user_name: "msandbox".to_string(),
-                host_name: "localhost".to_string(),
-            },
-        }];
-
-        assert_eq!(res.rows(), &expected);
-
-        let object_sorting = SortingPlan {
-            order_by: Some(OrderBy {
-                columns: vec![OrderedColumn::from_str("object_name DESC").unwrap()],
-            }),
-            limit: Some(Limit {
-                limit: 1,
-                offset: None,
-            }),
-        };
-
-        let res = query_column_set::<AggregateStats<FilterObject>>(c, Some(object_sorting.clone()))
-            .await
-            .unwrap();
-
-        let expected = [AggregateStats {
-            query_time: 0.0,
-            lock_time: 0.0,
-            rows_sent: 0,
-            rows_examined: 0,
-            calls: 1,
-            filter: FilterObject {
-                schema_name: None,
-                object_name: "user".into(),
-            },
-        }];
-
-        assert_eq!(res.rows(), &expected);
-
-        let res = query_column_set::<Calls<FilterObject>>(c, Some(object_sorting))
-            .await
-            .unwrap();
-
-        let expected = vec![Calls {
-            calls: 1,
-            filter: FilterObject {
-                schema_name: None,
-                object_name: "user".into(),
-            },
-        }];
-
-        assert_eq!(res.rows(), &expected);
+        for col in expected_cols {
+            assert!(
+                df.column(col).is_ok(),
+                "bucketed parquet should have column '{}'",
+                col
+            );
+        }
     }
 }
