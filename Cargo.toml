@@ -2,28 +2,26 @@
 name = "mysql-slowlog-analyzer"
 version = "0.1.0"
 edition = "2021"
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "slowlog"
+path = "src/main.rs"
 
 [dependencies]
-async-compat = "0.2.1"
-async-stream = "0.3.3"
-env_logger = "0.11.5"
-bytes = "1.4.0"
-directories = "5.0.1"
-nom = "7.1.1"
-mysql-slowlog-parser = {version = "0.2.0", features = ["chrono"]}
-rayon = "1.7.0"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "4.0.1"
+mysql-slowlog-parser = { version = "0.5.0" }
+winnow_datetime = { version = "0.3.0", features = ["time"] }
+polars = { version = "0.46.0", features = ["parquet", "lazy", "dtype-struct"] }
 sha2 = "0.10.6"
-duckdb = { version = "1.1.1", features = ["default", "bundled", "chrono"] }
-thiserror = "2.0.3"
-tokio = {version = "1.24.1", features = ["bytes", "macros", "io-std", "test-util", "rt-multi-thread"]}
-tokio-util = {version = "0.7.7", features = ["codec"]}
+thiserror = "1.0.38"
+tokio = { version = "1.24.1", features = ["bytes", "macros", "io-std", "test-util", "rt-multi-thread"] }
+tokio-util = { version = "0.7.7", features = ["codec"] }
 futures = "0.3.25"
-opentelemetry = {version = "0.27.0", optional = true }
-opentelemetry-otlp = {version = "0.27.0", optional = true }
-chrono = "0.4.38"
-chrono-tz = "0.10.0"
-log = "0.4.22"
+opentelemetry = { version = "0.18.0", optional = true }
+opentelemetry-otlp = { version = "0.11.0", optional = true }
 
 [features]
 otlp = ["opentelemetry", "opentelemetry-otlp"]

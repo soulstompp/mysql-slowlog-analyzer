@@ -28,24 +28,26 @@ impl SourceDataDir {
             PathBuf::from(project_dirs()?.data_dir())
         };
 
-        p.push(self.hash.to_string());
-
-        Ok(p)
-    }
-
-    pub fn duckdb_dir(&self) -> Result<PathBuf, Error> {
-        let mut p = self.sample_data_dir()?;
-
-        p.push("duckdb");
+        p.push(&self.hash);
 
         Ok(p)
     }
 
     pub fn parquet_dir(&self) -> Result<PathBuf, Error> {
         let mut p = self.sample_data_dir()?;
-
         p.push("parquet");
+        Ok(p)
+    }
 
+    pub fn raw_parquet_path(&self) -> Result<PathBuf, Error> {
+        let mut p = self.parquet_dir()?;
+        p.push("raw.parquet");
+        Ok(p)
+    }
+
+    pub fn bucketed_parquet_path(&self) -> Result<PathBuf, Error> {
+        let mut p = self.parquet_dir()?;
+        p.push("bucketed.parquet");
         Ok(p)
     }
 }
